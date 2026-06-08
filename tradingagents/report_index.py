@@ -10,6 +10,7 @@ from typing import Any
 def build_report_index(report_root: Path | str = "reports") -> dict[str, Any]:
     root = Path(report_root)
     value_root = root / "value_discover"
+    stock_root = root / "stock_analysis"
     runs: list[dict[str, Any]] = []
     if value_root.exists():
         for date_dir in sorted(value_root.iterdir(), reverse=True):
@@ -32,11 +33,38 @@ def build_report_index(report_root: Path | str = "reports") -> dict[str, Any]:
                     "llm_summary": _path(llm_summary if llm_summary.exists() else None),
                 }
             )
+    stock_runs: list[dict[str, Any]] = []
+    if stock_root.exists():
+        for status_path in sorted(stock_root.glob("*/*/*/status.json"), reverse=True):
+            try:
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            run_dir = status_path.parent
+            report_path = run_dir / "complete_report.md"
+            error_path = run_dir / "error.md"
+            stock_runs.append(
+                {
+                    "ticker": status.get("ticker"),
+                    "analysis_date": status.get("analysis_date"),
+                    "status": status.get("status"),
+                    "decision": status.get("decision"),
+                    "error": status.get("error"),
+                    "run_dir": str(run_dir),
+                    "complete_report": _path(report_path if report_path.exists() else None),
+                    "error_report": _path(error_path if error_path.exists() else None),
+                    "status_json": str(status_path),
+                    "completed_at": status.get("completed_at"),
+                    "started_at": status.get("started_at"),
+                }
+            )
     return {
         "version": 1,
         "report_root": str(root),
         "value_discover_runs": runs,
         "latest_value_discover": runs[0] if runs else None,
+        "stock_analysis_runs": stock_runs,
+        "latest_stock_analysis": stock_runs[0] if stock_runs else None,
     }
 
 

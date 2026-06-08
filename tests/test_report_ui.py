@@ -29,6 +29,28 @@ def test_report_index_discovers_latest_value_discover_run(tmp_path):
     assert index["latest_value_discover"]["public_equity_payload"].endswith(".json")
 
 
+def test_report_index_discovers_stock_analysis_runs(tmp_path):
+    run = tmp_path / "stock_analysis" / "NVDA" / "2026-06-07" / "101010"
+    run.mkdir(parents=True)
+    (run / "complete_report.md").write_text("# NVDA", encoding="utf-8")
+    (run / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "ticker": "NVDA",
+                "analysis_date": "2026-06-07",
+                "decision": "Hold",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    index = build_report_index(tmp_path)
+
+    assert index["latest_stock_analysis"]["ticker"] == "NVDA"
+    assert index["latest_stock_analysis"]["complete_report"].endswith("complete_report.md")
+
+
 def test_web_home_renders_report_links(tmp_path):
     day = tmp_path / "value_discover" / "2026-06-07"
     day.mkdir(parents=True)
@@ -46,5 +68,6 @@ def test_web_home_renders_report_links(tmp_path):
     html = render_home(tmp_path)
 
     assert "TradingAgents Reports" in html
+    assert "Run Stock Analysis" in html
     assert "Latest Run: 2026-06-07" in html
     assert "Open shortlist" in html

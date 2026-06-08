@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import html
 import json
 import subprocess
@@ -54,6 +55,33 @@ class TradingAgentsHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/?started=1")
             self.end_headers()
             return
+        if parsed.path == "/run/stock-analysis":
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(length).decode("utf-8")
+            form = parse_qs(body)
+            ticker = form.get("ticker", [""])[0].strip().upper()
+            analysis_date = form.get("analysis_date", [""])[0].strip()
+            if not ticker:
+                self.send_error(400, "Ticker is required")
+                return
+            command = [
+                sys.executable,
+                "-m",
+                "tradingagents.stock_analysis",
+                ticker,
+            ]
+            if analysis_date:
+                command.extend(["--date", analysis_date])
+            subprocess.Popen(
+                command,
+                cwd=PROJECT_ROOT,
+                stdout=(REPORT_ROOT / "stock_analysis.web.log").open("ab"),
+                stderr=subprocess.STDOUT,
+            )
+            self.send_response(303)
+            self.send_header("Location", "/?stock_started=1")
+            self.end_headers()
+            return
         self.send_error(404)
 
     def log_message(self, fmt: str, *args) -> None:
@@ -95,6 +123,7 @@ def render_home(report_root: Path) -> str:
     write_report_index(report_root)
     index = build_report_index(report_root)
     latest = index.get("latest_value_discover")
+    latest_stock = index.get("latest_stock_analysis")
     rows = []
     for run in index.get("value_discover_runs", []):
         rows.append(
@@ -107,7 +136,22 @@ def render_home(report_root: Path) -> str:
             f"<td>{_link(run.get('llm_summary'), 'LLM Summary')}</td>"
             "</tr>"
         )
+    stock_rows = []
+    for run in index.get("stock_analysis_runs", []):
+        report = run.get("complete_report") or run.get("error_report")
+        stock_rows.append(
+            "<tr>"
+            f"<td>{_e(run.get('ticker', ''))}</td>"
+            f"<td>{_e(run.get('analysis_date', ''))}</td>"
+            f"<td>{_e(run.get('status', ''))}</td>"
+            f"<td>{_e(_short(run.get('decision') or run.get('error') or ''))}</td>"
+            f"<td>{_link(report, 'Open')}</td>"
+            f"<td>{_link(run.get('status_json'), 'Status')}</td>"
+            "</tr>"
+        )
     latest_panel = render_latest_panel(latest)
+    stock_panel = render_stock_panel(latest_stock)
+    today = dt.date.today().isoformat()
     started = "Run started. Refresh in a minute for the new report." if "started=1" in "" else ""
     return f"""<!doctype html>
 <html lang="en">
@@ -123,6 +167,9 @@ def render_home(report_root: Path) -> str:
     h1 {{ font-size: 20px; margin: 0; letter-spacing:0; }}
     main {{ max-width: 1180px; margin: 0 auto; padding: 22px; }}
     .toolbar {{ display:flex; gap:10px; align-items:center; }}
+    .analysis-form {{ display:grid; grid-template-columns: minmax(140px, 1fr) minmax(160px, 1fr) auto; gap:12px; align-items:end; max-width:720px; }}
+    label span {{ color:var(--muted); display:block; font-size:12px; margin-bottom:4px; }}
+    input {{ width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; font:inherit; }}
     button, .button {{ border:1px solid var(--accent); background:var(--accent); color:white; border-radius:6px; padding:8px 12px; font-weight:600; cursor:pointer; text-decoration:none; }}
     .secondary {{ background:white; color:var(--accent); }}
     .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:18px; }}
@@ -135,7 +182,7 @@ def render_home(report_root: Path) -> str:
     th {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
     a {{ color:var(--accent); text-decoration:none; }}
     .muted {{ color:var(--muted); }}
-    @media (max-width: 780px) {{ header {{ display:block; }} .toolbar {{ margin-top:12px; }} .grid {{ grid-template-columns:1fr 1fr; }} table {{ font-size:12px; }} }}
+    @media (max-width: 780px) {{ header {{ display:block; }} .toolbar {{ margin-top:12px; }} .grid {{ grid-template-columns:1fr 1fr; }} .analysis-form {{ grid-template-columns:1fr; }} table {{ font-size:12px; }} }}
   </style>
 </head>
 <body>
@@ -147,7 +194,30 @@ def render_home(report_root: Path) -> str:
     </div>
   </header>
   <main>
+    <section class="panel">
+      <h2>Run Stock Analysis</h2>
+      <form method="post" action="/run/stock-analysis" class="analysis-form">
+        <label>
+          <span>Ticker</span>
+          <input name="ticker" placeholder="NVDA" required maxlength="16">
+        </label>
+        <label>
+          <span>Analysis date</span>
+          <input name="analysis_date" type="date" value="{today}">
+        </label>
+        <button type="submit">Analyze Stock</button>
+      </form>
+      <p class="muted">Runs in the background using the current TradingAgents config and writes a full Markdown report bundle.</p>
+    </section>
+    {stock_panel}
     {latest_panel}
+    <section class="panel">
+      <h2>Stock Analysis History</h2>
+      <table>
+        <thead><tr><th>Ticker</th><th>Date</th><th>Status</th><th>Decision/Error</th><th>Report</th><th>Status JSON</th></tr></thead>
+        <tbody>{''.join(stock_rows) or '<tr><td colspan="6">No stock analysis runs found.</td></tr>'}</tbody>
+      </table>
+    </section>
     <section class="panel">
       <h2>Report History</h2>
       <table>
@@ -159,6 +229,23 @@ def render_home(report_root: Path) -> str:
   </main>
 </body>
 </html>"""
+
+
+def render_stock_panel(latest: dict | None) -> str:
+    if not latest:
+        return "<section class='panel'><h2>Latest Stock Analysis</h2><p>No stock analysis runs found.</p></section>"
+    report = latest.get("complete_report") or latest.get("error_report")
+    return (
+        "<section class='panel'>"
+        f"<h2>Latest Stock Analysis: {_e(latest.get('ticker', ''))}</h2>"
+        "<div class='grid'>"
+        f"<div class='metric'><span>Status</span><strong>{_e(latest.get('status', 'unknown'))}</strong></div>"
+        f"<div class='metric'><span>Analysis Date</span><strong>{_e(latest.get('analysis_date', ''))}</strong></div>"
+        f"<div class='metric'><span>Decision</span><strong>{_e(_short(latest.get('decision') or 'N/A', 24))}</strong></div>"
+        f"<div class='metric'><span>Report</span><strong>{_link(report, 'Open')}</strong></div>"
+        "</div>"
+        "</section>"
+    )
 
 
 def render_latest_panel(latest: dict | None) -> str:
@@ -230,6 +317,11 @@ def _load_json(path: Path) -> dict | None:
 
 def _e(value: object) -> str:
     return html.escape(str(value), quote=True)
+
+
+def _short(value: object, limit: int = 80) -> str:
+    text = str(value).replace("\n", " ").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 if __name__ == "__main__":
