@@ -12,11 +12,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
 from tradingagents.report_index import build_report_index, write_report_index
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORT_ROOT = PROJECT_ROOT / "reports"
+WEB_PROVIDER_OPTIONS = [
+    ("OpenAI", "openai"),
+    ("Google", "google"),
+    ("Anthropic", "anthropic"),
+    ("xAI", "xai"),
+    ("DeepSeek", "deepseek"),
+    ("Qwen", "qwen"),
+    ("GLM", "glm"),
+    ("MiniMax", "minimax"),
+    ("NVIDIA NIM", "nvidia"),
+    ("Ollama", "ollama"),
+]
 
 
 class TradingAgentsHandler(BaseHTTPRequestHandler):
@@ -61,6 +75,10 @@ class TradingAgentsHandler(BaseHTTPRequestHandler):
             form = parse_qs(body)
             ticker = form.get("ticker", [""])[0].strip().upper()
             analysis_date = form.get("analysis_date", [""])[0].strip()
+            llm_provider = form.get("llm_provider", [DEFAULT_CONFIG["llm_provider"]])[0].strip()
+            quick_model = form.get("quick_model", [DEFAULT_CONFIG["quick_think_llm"]])[0].strip()
+            deep_model = form.get("deep_model", [DEFAULT_CONFIG["deep_think_llm"]])[0].strip()
+            backend_url = form.get("backend_url", [""])[0].strip()
             if not ticker:
                 self.send_error(400, "Ticker is required")
                 return
@@ -72,6 +90,14 @@ class TradingAgentsHandler(BaseHTTPRequestHandler):
             ]
             if analysis_date:
                 command.extend(["--date", analysis_date])
+            if llm_provider:
+                command.extend(["--provider", llm_provider])
+            if quick_model:
+                command.extend(["--quick-model", quick_model])
+            if deep_model:
+                command.extend(["--deep-model", deep_model])
+            if backend_url:
+                command.extend(["--backend-url", backend_url])
             subprocess.Popen(
                 command,
                 cwd=PROJECT_ROOT,
@@ -143,7 +169,8 @@ def render_home(report_root: Path) -> str:
             "<tr>"
             f"<td>{_e(run.get('ticker', ''))}</td>"
             f"<td>{_e(run.get('analysis_date', ''))}</td>"
-            f"<td>{_e(run.get('status', ''))}</td>"
+            f"<td>{_status_badge(run.get('status', ''))}</td>"
+            f"<td>{_e(run.get('llm_provider') or '')}<br><span class='muted'>{_e(_short(run.get('deep_think_llm') or '', 32))}</span></td>"
             f"<td>{_e(_short(run.get('decision') or run.get('error') or ''))}</td>"
             f"<td>{_link(report, 'Open')}</td>"
             f"<td>{_link(run.get('status_json'), 'Status')}</td>"
@@ -152,6 +179,9 @@ def render_home(report_root: Path) -> str:
     latest_panel = render_latest_panel(latest)
     stock_panel = render_stock_panel(latest_stock)
     today = dt.date.today().isoformat()
+    provider_options = _provider_options(DEFAULT_CONFIG["llm_provider"])
+    quick_options = _model_options("quick", DEFAULT_CONFIG["llm_provider"], DEFAULT_CONFIG["quick_think_llm"])
+    deep_options = _model_options("deep", DEFAULT_CONFIG["llm_provider"], DEFAULT_CONFIG["deep_think_llm"])
     started = "Run started. Refresh in a minute for the new report." if "started=1" in "" else ""
     return f"""<!doctype html>
 <html lang="en">
@@ -165,12 +195,14 @@ def render_home(report_root: Path) -> str:
     body {{ margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); background: var(--bg); }}
     header {{ padding: 18px 24px; border-bottom: 1px solid var(--line); background: var(--panel); display:flex; align-items:center; justify-content:space-between; gap:16px; }}
     h1 {{ font-size: 20px; margin: 0; letter-spacing:0; }}
+    h2 {{ margin-top:0; }}
     main {{ max-width: 1180px; margin: 0 auto; padding: 22px; }}
     .toolbar {{ display:flex; gap:10px; align-items:center; }}
-    .analysis-form {{ display:grid; grid-template-columns: minmax(140px, 1fr) minmax(160px, 1fr) auto; gap:12px; align-items:end; max-width:720px; }}
+    .analysis-form {{ display:grid; grid-template-columns: minmax(120px, .7fr) minmax(150px, .8fr) minmax(150px, .9fr) minmax(220px, 1.4fr) minmax(220px, 1.4fr) auto; gap:12px; align-items:end; }}
     label span {{ color:var(--muted); display:block; font-size:12px; margin-bottom:4px; }}
-    input {{ width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; font:inherit; }}
-    button, .button {{ border:1px solid var(--accent); background:var(--accent); color:white; border-radius:6px; padding:8px 12px; font-weight:600; cursor:pointer; text-decoration:none; }}
+    input, select {{ width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; font:inherit; background:white; }}
+    button, .button {{ border:1px solid var(--accent); background:var(--accent); color:white; border-radius:6px; padding:8px 12px; font-weight:600; cursor:pointer; text-decoration:none; white-space:nowrap; }}
+    button:disabled {{ opacity:.58; cursor:progress; }}
     .secondary {{ background:white; color:var(--accent); }}
     .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:18px; }}
     .grid {{ display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:12px; }}
@@ -182,7 +214,17 @@ def render_home(report_root: Path) -> str:
     th {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
     a {{ color:var(--accent); text-decoration:none; }}
     .muted {{ color:var(--muted); }}
-    @media (max-width: 780px) {{ header {{ display:block; }} .toolbar {{ margin-top:12px; }} .grid {{ grid-template-columns:1fr 1fr; }} .analysis-form {{ grid-template-columns:1fr; }} table {{ font-size:12px; }} }}
+    .steps {{ display:grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap:8px; margin-top:14px; }}
+    .step {{ border:1px solid var(--line); border-radius:6px; padding:10px; min-height:68px; }}
+    .step strong {{ display:block; font-size:13px; margin-top:4px; }}
+    .badge {{ display:inline-flex; align-items:center; border-radius:999px; padding:2px 8px; font-size:12px; font-weight:700; text-transform:uppercase; }}
+    .status-running {{ background:#dbeafe; color:#1d4ed8; }}
+    .status-ok {{ background:#dcfce7; color:#166534; }}
+    .status-error {{ background:#fee2e2; color:#991b1b; }}
+    .status-pending, .status-queued {{ background:#eef2f7; color:#475569; }}
+    .events {{ margin:12px 0 0; padding-left:18px; color:var(--muted); max-height:140px; overflow:auto; }}
+    @media (max-width: 1060px) {{ .analysis-form {{ grid-template-columns:1fr 1fr; }} .steps {{ grid-template-columns:1fr 1fr; }} }}
+    @media (max-width: 780px) {{ header {{ display:block; }} .toolbar {{ margin-top:12px; }} .grid {{ grid-template-columns:1fr 1fr; }} .analysis-form {{ grid-template-columns:1fr; }} .steps {{ grid-template-columns:1fr; }} table {{ font-size:12px; }} }}
   </style>
 </head>
 <body>
@@ -196,7 +238,7 @@ def render_home(report_root: Path) -> str:
   <main>
     <section class="panel">
       <h2>Run Stock Analysis</h2>
-      <form method="post" action="/run/stock-analysis" class="analysis-form">
+      <form method="post" action="/run/stock-analysis" class="analysis-form" data-analysis-form>
         <label>
           <span>Ticker</span>
           <input name="ticker" placeholder="NVDA" required maxlength="16">
@@ -205,17 +247,29 @@ def render_home(report_root: Path) -> str:
           <span>Analysis date</span>
           <input name="analysis_date" type="date" value="{today}">
         </label>
-        <button type="submit">Analyze Stock</button>
+        <label>
+          <span>Provider</span>
+          <select name="llm_provider">{provider_options}</select>
+        </label>
+        <label>
+          <span>Quick model</span>
+          <select name="quick_model">{quick_options}</select>
+        </label>
+        <label>
+          <span>Deep model</span>
+          <select name="deep_model">{deep_options}</select>
+        </label>
+        <button type="submit" data-analysis-button>Analyze Stock</button>
       </form>
-      <p class="muted">Runs in the background using the current TradingAgents config and writes a full Markdown report bundle.</p>
+      <p class="muted">Runs in the background and writes a full Markdown report bundle. Each run gets its own unique folder.</p>
     </section>
     {stock_panel}
     {latest_panel}
     <section class="panel">
       <h2>Stock Analysis History</h2>
       <table>
-        <thead><tr><th>Ticker</th><th>Date</th><th>Status</th><th>Decision/Error</th><th>Report</th><th>Status JSON</th></tr></thead>
-        <tbody>{''.join(stock_rows) or '<tr><td colspan="6">No stock analysis runs found.</td></tr>'}</tbody>
+        <thead><tr><th>Ticker</th><th>Date</th><th>Status</th><th>Model</th><th>Decision/Error</th><th>Report</th><th>Status JSON</th></tr></thead>
+        <tbody>{''.join(stock_rows) or '<tr><td colspan="7">No stock analysis runs found.</td></tr>'}</tbody>
       </table>
     </section>
     <section class="panel">
@@ -227,6 +281,35 @@ def render_home(report_root: Path) -> str:
     </section>
     <p class="muted">Outputs are research support, not financial advice or order recommendations.</p>
   </main>
+  <script>
+    const form = document.querySelector("[data-analysis-form]");
+    if (form) {{
+      const provider = form.querySelector("select[name='llm_provider']");
+      const syncModel = (select) => {{
+        if (!provider || !select) return;
+        const current = select.selectedOptions[0];
+        if (current && current.dataset.provider === provider.value) return;
+        const next = Array.from(select.options).find((option) => option.dataset.provider === provider.value);
+        if (next) next.selected = true;
+      }};
+      if (provider) {{
+        provider.addEventListener("change", () => {{
+          syncModel(form.querySelector("select[name='quick_model']"));
+          syncModel(form.querySelector("select[name='deep_model']"));
+        }});
+      }}
+      form.addEventListener("submit", () => {{
+        const button = form.querySelector("[data-analysis-button]");
+        if (button) {{
+          button.disabled = true;
+          button.textContent = "Starting...";
+        }}
+      }});
+    }}
+    if (document.querySelector(".status-running, .status-queued")) {{
+      setTimeout(() => window.location.reload(), 5000);
+    }}
+  </script>
 </body>
 </html>"""
 
@@ -235,15 +318,31 @@ def render_stock_panel(latest: dict | None) -> str:
     if not latest:
         return "<section class='panel'><h2>Latest Stock Analysis</h2><p>No stock analysis runs found.</p></section>"
     report = latest.get("complete_report") or latest.get("error_report")
+    steps = "".join(
+        "<div class='step'>"
+        f"{_status_badge(step.get('status', 'pending'))}"
+        f"<strong>{_e(step.get('label', step.get('id', 'Step')))}</strong>"
+        f"<span class='muted'>{_e(_short(step.get('error') or step.get('report_path') or '', 42))}</span>"
+        "</div>"
+        for step in latest.get("steps", [])
+    )
+    events = "".join(
+        f"<li>{_e(_short(event.get('message', ''), 120))}</li>"
+        for event in latest.get("events", [])[-8:]
+    )
+    steps_html = f"<div class='steps'>{steps}</div>" if steps else ""
+    events_html = f"<ol class='events'>{events}</ol>" if events else ""
     return (
         "<section class='panel'>"
         f"<h2>Latest Stock Analysis: {_e(latest.get('ticker', ''))}</h2>"
         "<div class='grid'>"
-        f"<div class='metric'><span>Status</span><strong>{_e(latest.get('status', 'unknown'))}</strong></div>"
+        f"<div class='metric'><span>Status</span><strong>{_status_badge(latest.get('status', 'unknown'))}</strong></div>"
         f"<div class='metric'><span>Analysis Date</span><strong>{_e(latest.get('analysis_date', ''))}</strong></div>"
-        f"<div class='metric'><span>Decision</span><strong>{_e(_short(latest.get('decision') or 'N/A', 24))}</strong></div>"
+        f"<div class='metric'><span>Model</span><strong>{_e(latest.get('llm_provider') or 'N/A')}</strong><span>{_e(_short(latest.get('deep_think_llm') or '', 38))}</span></div>"
         f"<div class='metric'><span>Report</span><strong>{_link(report, 'Open')}</strong></div>"
         "</div>"
+        f"{steps_html}"
+        f"{events_html}"
         "</section>"
     )
 
@@ -322,6 +421,41 @@ def _e(value: object) -> str:
 def _short(value: object, limit: int = 80) -> str:
     text = str(value).replace("\n", " ").strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _provider_options(selected: str) -> str:
+    options = []
+    for label, value in WEB_PROVIDER_OPTIONS:
+        if value not in MODEL_OPTIONS:
+            continue
+        options.append(
+            f"<option value='{_e(value)}'{' selected' if value == selected else ''}>{_e(label)}</option>"
+        )
+    return "".join(options)
+
+
+def _model_options(mode: str, selected_provider: str, selected_model: str) -> str:
+    groups = []
+    for provider_label, provider in WEB_PROVIDER_OPTIONS:
+        mode_options = MODEL_OPTIONS.get(provider, {}).get(mode)
+        if not mode_options:
+            continue
+        options = []
+        for label, value in mode_options:
+            if value == "custom":
+                continue
+            selected = value == selected_model and provider == selected_provider
+            options.append(
+                f"<option value='{_e(value)}' data-provider='{_e(provider)}'{' selected' if selected else ''}>{_e(label)}</option>"
+            )
+        groups.append(f"<optgroup label='{_e(provider_label)}'>{''.join(options)}</optgroup>")
+    return "".join(groups)
+
+
+def _status_badge(status: object) -> str:
+    normalized = str(status or "unknown").lower()
+    class_name = normalized if normalized in {"running", "ok", "error", "pending", "queued"} else "pending"
+    return f"<span class='badge status-{_e(class_name)}'>{_e(normalized)}</span>"
 
 
 if __name__ == "__main__":

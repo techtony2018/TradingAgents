@@ -40,6 +40,11 @@ def test_report_index_discovers_stock_analysis_runs(tmp_path):
                 "ticker": "NVDA",
                 "analysis_date": "2026-06-07",
                 "decision": "Hold",
+                "llm_provider": "nvidia",
+                "quick_think_llm": "google/gemma-3n-e4b-it",
+                "deep_think_llm": "google/gemma-4-31b-it",
+                "steps": [{"id": "run_agents", "label": "Run analyst and decision agents", "status": "ok"}],
+                "events": [{"kind": "llm", "message": "LLM completed"}],
             }
         ),
         encoding="utf-8",
@@ -49,6 +54,8 @@ def test_report_index_discovers_stock_analysis_runs(tmp_path):
 
     assert index["latest_stock_analysis"]["ticker"] == "NVDA"
     assert index["latest_stock_analysis"]["complete_report"].endswith("complete_report.md")
+    assert index["latest_stock_analysis"]["llm_provider"] == "nvidia"
+    assert index["latest_stock_analysis"]["steps"][0]["status"] == "ok"
 
 
 def test_web_home_renders_report_links(tmp_path):
@@ -69,5 +76,9 @@ def test_web_home_renders_report_links(tmp_path):
 
     assert "TradingAgents Reports" in html
     assert "Run Stock Analysis" in html
+    assert "Analyze Stock" in html
+    assert "NVIDIA NIM" in html
+    assert "google/gemma-4-31b-it" in html
+    assert "data-analysis-form" in html
     assert "Latest Run: 2026-06-07" in html
     assert "Open shortlist" in html

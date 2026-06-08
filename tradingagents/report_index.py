@@ -35,7 +35,12 @@ def build_report_index(report_root: Path | str = "reports") -> dict[str, Any]:
             )
     stock_runs: list[dict[str, Any]] = []
     if stock_root.exists():
-        for status_path in sorted(stock_root.glob("*/*/*/status.json"), reverse=True):
+        status_paths = sorted(
+            stock_root.glob("*/*/*/status.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for status_path in status_paths:
             try:
                 status = json.loads(status_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -56,6 +61,11 @@ def build_report_index(report_root: Path | str = "reports") -> dict[str, Any]:
                     "status_json": str(status_path),
                     "completed_at": status.get("completed_at"),
                     "started_at": status.get("started_at"),
+                    "llm_provider": status.get("llm_provider"),
+                    "quick_think_llm": status.get("quick_think_llm"),
+                    "deep_think_llm": status.get("deep_think_llm"),
+                    "steps": status.get("steps", []),
+                    "events": status.get("events", []),
                 }
             )
     return {
