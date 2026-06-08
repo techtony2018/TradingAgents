@@ -32,6 +32,12 @@ class NormalizedChatOpenAI(ChatOpenAI):
     def invoke(self, input, config=None, **kwargs):
         return normalize_content(super().invoke(input, config, **kwargs))
 
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        caps = get_capabilities(self.model_name)
+        if not caps.supports_tool_choice:
+            tool_choice = None
+        return super().bind_tools(tools, tool_choice=tool_choice, **kwargs)
+
     def with_structured_output(self, schema, *, method=None, **kwargs):
         caps = get_capabilities(self.model_name)
         if caps.preferred_structured_method == "none":
@@ -136,11 +142,76 @@ class MinimaxChatOpenAI(NormalizedChatOpenAI):
         return payload
 
 
+class NvidiaChatOpenAI(NormalizedChatOpenAI):
+    """NVIDIA NIM-compatible payload adjustments.
+
+    NVIDIA's hosted NIM chat completions endpoint is OpenAI-compatible, but
+    its model snippets document ``max_tokens`` rather than the newer
+    ``max_completion_tokens`` name LangChain emits. Keep the public
+    constructor idiomatic while matching NVIDIA's documented payload shape.
+    """
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        # Hosted preview NIM endpoints can reject even implicit tool selection
+        # with: '"auto" tool choice requires --enable-auto-tool-choice...'.
+        # Keep the analyst flow alive by letting the model answer from prompt
+        # context instead of attaching a tools array the preview server rejects.
+        return self.bind(**kwargs)
+
+    def with_structured_output(self, schema, *, method=None, **kwargs):
+        return super().with_structured_output(
+            schema,
+            method=method or "json_mode",
+            **kwargs,
+        )
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if "max_completion_tokens" in payload and "max_tokens" not in payload:
+            payload["max_tokens"] = payload.pop("max_completion_tokens")
+        return payload
+
+
 # Kwargs forwarded from user config to ChatOpenAI
 _PASSTHROUGH_KWARGS = (
     "timeout", "max_retries", "reasoning_effort",
+    "temperature", "top_p", "frequency_penalty", "presence_penalty",
+    "max_completion_tokens", "extra_body",
     "api_key", "callbacks", "http_client", "http_async_client",
 )
+
+
+# NVIDIA Build model cards include tuned sampling defaults in their code
+# snippets. Apply those defaults when callers select the corresponding model;
+# custom model IDs keep the provider default behavior.
+_NVIDIA_MODEL_DEFAULTS: dict[str, dict[str, Any]] = {
+    "google/gemma-4-31b-it": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "max_completion_tokens": 16384,
+        "extra_body": {
+            "top_k": 64,
+            "chat_template_kwargs": {"enable_thinking": True},
+        },
+    },
+    "minimaxai/minimax-m2.7": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "max_completion_tokens": 8192,
+    },
+    "qwen/qwen3-coder-480b-a35b-instruct": {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "max_completion_tokens": 4096,
+    },
+    "google/gemma-3n-e4b-it": {
+        "temperature": 0.2,
+        "top_p": 0.7,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "max_completion_tokens": 512,
+    },
+}
 
 # Provider base URLs. API-key env vars live in api_key_env.PROVIDER_API_KEY_ENV
 # (one canonical mapping consulted by both this client and the CLI's
@@ -156,6 +227,7 @@ _PROVIDER_BASE_URL = {
     "glm-cn":     "https://open.bigmodel.cn/api/paas/v4/",
     "minimax":    "https://api.minimax.io/v1",
     "minimax-cn": "https://api.minimaxi.com/v1",
+    "nvidia":     "https://integrate.api.nvidia.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "ollama":     "http://localhost:11434/v1",
 }
@@ -178,12 +250,12 @@ def _resolve_provider_base_url(provider: str) -> Optional[str]:
 
 
 class OpenAIClient(BaseLLMClient):
-    """Client for OpenAI, Ollama, OpenRouter, and xAI providers.
+    """Client for OpenAI-compatible chat providers.
 
     For native OpenAI models, uses the Responses API (/v1/responses) which
     supports reasoning_effort with function tools across all model families
-    (GPT-4.1, GPT-5). Third-party compatible providers (xAI, OpenRouter,
-    Ollama) use standard Chat Completions.
+    (GPT-4.1, GPT-5). Third-party compatible providers use standard Chat
+    Completions.
     """
 
     def __init__(
@@ -227,6 +299,10 @@ class OpenAIClient(BaseLLMClient):
             if key in self.kwargs:
                 llm_kwargs[key] = self.kwargs[key]
 
+        if self.provider == "nvidia":
+            for key, value in _NVIDIA_MODEL_DEFAULTS.get(self.model.lower(), {}).items():
+                llm_kwargs.setdefault(key, value)
+
         # Native OpenAI: use Responses API for consistent behavior across
         # all model families. Third-party providers use Chat Completions.
         if self.provider == "openai":
@@ -238,6 +314,8 @@ class OpenAIClient(BaseLLMClient):
             chat_cls = DeepSeekChatOpenAI
         elif self.provider in ("minimax", "minimax-cn"):
             chat_cls = MinimaxChatOpenAI
+        elif self.provider == "nvidia":
+            chat_cls = NvidiaChatOpenAI
         else:
             chat_cls = NormalizedChatOpenAI
         return chat_cls(**llm_kwargs)

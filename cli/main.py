@@ -28,6 +28,15 @@ from tradingagents.graph.analyst_execution import (
     sync_analyst_tracker_from_chunk,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.value_discover import (
+    DEFAULT_SCHEDULE_HOUR,
+    DEFAULT_SCHEDULE_MINUTE,
+    PACIFIC_TZ,
+    cron_entry as value_discover_cron_entry,
+    install_cron as install_value_discover_cron,
+    run_llm_analysis_for_candidates,
+    run_value_discover,
+)
 from cli.models import AnalystType
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
@@ -1263,6 +1272,30 @@ def run_analysis(checkpoint: bool = False):
         display_complete_report(final_state)
 
 
+@app.callback(invoke_without_command=True)
+def default(
+    ctx: typer.Context,
+    checkpoint: bool = typer.Option(
+        False,
+        "--checkpoint",
+        help="Enable checkpoint/resume: save state after each node so a crashed run can resume.",
+    ),
+    clear_checkpoints: bool = typer.Option(
+        False,
+        "--clear-checkpoints",
+        help="Delete all saved checkpoints before running (force fresh start).",
+    ),
+):
+    """Run the interactive analyzer when no subcommand is provided."""
+    if ctx.invoked_subcommand is not None:
+        return
+    if clear_checkpoints:
+        from tradingagents.graph.checkpointer import clear_all_checkpoints
+        n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
+        console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
+    run_analysis(checkpoint=checkpoint)
+
+
 @app.command()
 def analyze(
     checkpoint: bool = typer.Option(
@@ -1281,6 +1314,80 @@ def analyze(
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
         console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
     run_analysis(checkpoint=checkpoint)
+
+
+@app.command("value-discover")
+def value_discover(
+    limit: int = typer.Option(
+        10,
+        "--limit",
+        min=1,
+        max=50,
+        help="Number of undervaluation candidates to include in the watchlist.",
+    ),
+    output_dir: Path = typer.Option(
+        Path("reports/value_discover"),
+        "--output-dir",
+        help="Directory where Markdown and CSV Value Discover reports are written.",
+    ),
+    print_cron: bool = typer.Option(
+        False,
+        "--print-cron",
+        help="Print the daily 7:20 AM Pacific cron entry without installing it.",
+    ),
+    install_cron: bool = typer.Option(
+        False,
+        "--install-cron",
+        help="Install or replace the daily 7:20 AM Pacific Value Discover crontab entry.",
+    ),
+    run_llm: bool = typer.Option(
+        True,
+        "--llm/--skip-llm",
+        help="Run TradingAgents LLM analysis for the discovered stocks.",
+    ),
+):
+    """Generate the Value Discover undervaluation watchlist."""
+    if print_cron:
+        console.print(value_discover_cron_entry(Path.cwd()))
+        return
+
+    if install_cron:
+        entry = install_value_discover_cron(Path.cwd())
+        console.print(
+            f"[green]✓ Value Discover scheduled for "
+            f"{DEFAULT_SCHEDULE_HOUR:02d}:{DEFAULT_SCHEDULE_MINUTE:02d} "
+            f"{PACIFIC_TZ} daily.[/green]"
+        )
+        console.print(entry)
+        return
+
+    console.print("[bold cyan]Running Value Discover...[/bold cyan]")
+    console.print(
+        "[yellow]Research shortlist only. Not financial advice or an order recommendation.[/yellow]"
+    )
+    candidates, markdown_path, csv_path = run_value_discover(
+        limit=limit,
+        output_dir=output_dir,
+    )
+    console.print(f"[green]✓ Found {len(candidates)} candidates.[/green]")
+    console.print(f"[dim]Markdown:[/dim] {markdown_path.resolve()}")
+    console.print(f"[dim]CSV:[/dim] {csv_path.resolve()}")
+    for rank, item in enumerate(candidates, start=1):
+        console.print(
+            f"{rank:>2}. [bold]{item.symbol}[/bold] "
+            f"score={item.score:.1f} price={item.price if item.price is not None else 'N/A'} "
+            f"thesis={item.thesis}"
+        )
+
+    if run_llm:
+        console.print("\n[bold cyan]Running LLM analysis for Value Discover candidates...[/bold cyan]")
+        results, summary_path = run_llm_analysis_for_candidates(
+            candidates,
+            output_dir=output_dir,
+        )
+        ok_count = sum(1 for result in results if result.status == "ok")
+        console.print(f"[green]✓ LLM analysis complete: {ok_count}/{len(results)} succeeded.[/green]")
+        console.print(f"[dim]LLM summary:[/dim] {summary_path.resolve()}")
 
 
 if __name__ == "__main__":

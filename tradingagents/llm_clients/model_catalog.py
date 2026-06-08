@@ -73,6 +73,26 @@ _MINIMAX_MODELS: Dict[str, List[ModelOption]] = {
 }
 
 
+_NVIDIA_MODELS: Dict[str, List[ModelOption]] = {
+    "quick": [
+        ("Google Gemma 3n E4B IT - Efficient multimodal edge model", "google/gemma-3n-e4b-it"),
+        ("Step 3.7 Flash - Fast multimodal reasoning and coding", "stepfun-ai/step-3-7-flash"),
+        ("MiniMax M2.7 - Open-source coding, reasoning, office tasks", "minimaxai/minimax-m2.7"),
+        ("Seed OSS 36B Instruct - Long-context reasoning and agentic work", "bytedance/seed-oss-36b-instruct"),
+        ("Custom model ID", "custom"),
+    ],
+    "deep": [
+        ("Google Gemma 4 31B IT - Multimodal reasoning, coding, agentic workflows", "google/gemma-4-31b-it"),
+        ("MiniMax M2.7 - 230B open-source coding and tool-use model", "minimaxai/minimax-m2.7"),
+        ("Qwen3 Coder 480B A35B - 256K agentic coding model", "qwen/qwen3-coder-480b-a35b-instruct"),
+        ("GLM-5.1 - Flagship agentic coding and reasoning", "z-ai/glm5.1"),
+        ("Mistral Large 3 675B - General-purpose MoE VLM", "mistralai/mistral-large-3-675b-instruct-2512"),
+        ("Mistral Nemotron - Agentic coding and function calling", "mistralai/mistral-nemotron"),
+        ("Custom model ID", "custom"),
+    ],
+}
+
+
 MODEL_OPTIONS: ProviderModeOptions = {
     "openai": {
         "quick": [
@@ -153,6 +173,11 @@ MODEL_OPTIONS: ProviderModeOptions = {
     # so the two provider keys share one model list.
     "minimax": _MINIMAX_MODELS,
     "minimax-cn": _MINIMAX_MODELS,
+    # NVIDIA NIM hosted preview/free endpoints are OpenAI-compatible.
+    # The catalog changes frequently, so we expose a curated set from the
+    # Build.NVIDIA.com preview page plus "Custom model ID" for any current
+    # model card ID (for example publisher/model-name).
+    "nvidia": _NVIDIA_MODELS,
     # OpenRouter: fetched dynamically. Azure: any deployed model name.
     # Ollama display labels intentionally omit a "local" marker — the
     # endpoint is now configurable via OLLAMA_BASE_URL, so the same labels

@@ -149,6 +149,7 @@ export ZHIPU_API_KEY=...           # GLM via Z.AI (international)
 export ZHIPU_CN_API_KEY=...        # GLM via BigModel (China, open.bigmodel.cn)
 export MINIMAX_API_KEY=...         # MiniMax — Global (api.minimax.io, M2.x, 204K ctx)
 export MINIMAX_CN_API_KEY=...      # MiniMax — China (api.minimaxi.com, M2.x, 204K ctx)
+export NVIDIA_API_KEY=...          # NVIDIA NIM — Build.NVIDIA.com hosted OpenAI-compatible endpoints
 export OPENROUTER_API_KEY=...      # OpenRouter
 export ALPHA_VANTAGE_API_KEY=...   # Alpha Vantage
 ```
@@ -170,6 +171,30 @@ tradingagents          # installed command
 python -m cli.main     # alternative: run directly from source
 ```
 You will see a screen where you can select your desired tickers, analysis date, LLM provider, research depth, and more.
+
+### Value Discover
+
+Value Discover generates a daily quantitative shortlist of up to 10 potentially undervalued US stocks for further day-trading or long-term-investment research, then runs TradingAgents LLM analysis on those candidates. It writes Markdown and CSV reports under `reports/value_discover/` and is a research screen, not financial advice or an order recommendation.
+
+Run it immediately:
+```bash
+tradingagents value-discover
+```
+
+Run only the quantitative shortlist without LLM analysis:
+```bash
+tradingagents value-discover --skip-llm
+```
+
+Install the daily schedule for 7:20 AM Pacific time:
+```bash
+tradingagents value-discover --install-cron
+```
+
+Preview the cron entry without installing it:
+```bash
+tradingagents value-discover --print-cron
+```
 
 <p align="center">
   <img src="assets/cli/cli_init.png" width="100%" style="display: inline-block; margin: 0 2%;">
@@ -213,7 +238,7 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
 
 config = DEFAULT_CONFIG.copy()
-config["llm_provider"] = "openai"        # openai, google, anthropic, xai, deepseek, qwen, qwen-cn, glm, glm-cn, minimax, minimax-cn, openrouter, ollama, azure
+config["llm_provider"] = "openai"        # openai, google, anthropic, xai, deepseek, qwen, qwen-cn, glm, glm-cn, minimax, minimax-cn, nvidia, openrouter, ollama, azure
 config["deep_think_llm"] = "gpt-5.4"     # Model for complex reasoning
 config["quick_think_llm"] = "gpt-5.4-mini" # Model for quick tasks
 config["max_debate_rounds"] = 2
