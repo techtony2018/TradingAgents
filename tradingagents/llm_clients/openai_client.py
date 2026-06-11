@@ -185,6 +185,15 @@ _PASSTHROUGH_KWARGS = (
 # snippets. Apply those defaults when callers select the corresponding model;
 # custom model IDs keep the provider default behavior.
 _NVIDIA_MODEL_DEFAULTS: dict[str, dict[str, Any]] = {
+    "nvidia/nemotron-3-ultra-550b-a55b": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "max_completion_tokens": 16384,
+        "extra_body": {
+            "chat_template_kwargs": {"enable_thinking": True},
+            "reasoning_budget": 16384,
+        },
+    },
     "google/gemma-4-31b-it": {
         "temperature": 1.0,
         "top_p": 0.95,

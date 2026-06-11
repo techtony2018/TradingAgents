@@ -82,6 +82,7 @@ _NVIDIA_MODELS: Dict[str, List[ModelOption]] = {
         ("Custom model ID", "custom"),
     ],
     "deep": [
+        ("NVIDIA Nemotron 3 Ultra 550B A55B - 1M context frontier reasoning MoE", "nvidia/nemotron-3-ultra-550b-a55b"),
         ("Google Gemma 4 31B IT - Multimodal reasoning, coding, agentic workflows", "google/gemma-4-31b-it"),
         ("MiniMax M2.7 - 230B open-source coding and tool-use model", "minimaxai/minimax-m2.7"),
         ("Qwen3 Coder 480B A35B - 256K agentic coding model", "qwen/qwen3-coder-480b-a35b-instruct"),

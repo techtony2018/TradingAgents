@@ -16,6 +16,7 @@ def test_nvidia_catalog_includes_required_models():
         for mode in ("quick", "deep")
         for _, value in get_model_options("nvidia", mode)
     }
+    assert "nvidia/nemotron-3-ultra-550b-a55b" in models
     assert "google/gemma-4-31b-it" in models
     assert "minimaxai/minimax-m2.7" in models
     assert "qwen/qwen3-coder-480b-a35b-instruct" in models
@@ -68,6 +69,26 @@ def test_nvidia_applies_gemma_4_sampling_defaults(monkeypatch):
     assert payload["extra_body"] == {
         "top_k": 64,
         "chat_template_kwargs": {"enable_thinking": True},
+    }
+    assert "max_completion_tokens" not in payload
+
+
+def test_nvidia_applies_nemotron_3_ultra_sampling_defaults(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+    llm = OpenAIClient(
+        model="nvidia/nemotron-3-ultra-550b-a55b",
+        provider="nvidia",
+    ).get_llm()
+
+    payload = llm._get_request_payload([HumanMessage(content="hello")])
+
+    assert payload["model"] == "nvidia/nemotron-3-ultra-550b-a55b"
+    assert payload["temperature"] == 1.0
+    assert payload["top_p"] == 0.95
+    assert payload["max_tokens"] == 16384
+    assert payload["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": True},
+        "reasoning_budget": 16384,
     }
     assert "max_completion_tokens" not in payload
 
