@@ -4,7 +4,7 @@ import warnings
 import pytest
 
 from tradingagents.llm_clients.base_client import BaseLLMClient
-from tradingagents.llm_clients.model_catalog import get_known_models
+from tradingagents.llm_clients.model_catalog import get_known_models, get_model_options
 from tradingagents.llm_clients.validators import validate_model
 
 
@@ -53,3 +53,22 @@ class ModelValidationTests(unittest.TestCase):
                     client.get_llm()
 
                 self.assertEqual(caught, [])
+
+    def test_openrouter_catalog_includes_project_preferred_models(self):
+        requested_models = {
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "google/gemma-4-26b-a4b-it",
+            "qwen/qwen3-coder",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+            "openrouter/free",
+        }
+        catalog_models = {
+            value
+            for mode in ("quick", "deep")
+            for _, value in get_model_options("openrouter", mode)
+        }
+
+        self.assertTrue(requested_models.issubset(catalog_models))
+        self.assertIn("custom", catalog_models)

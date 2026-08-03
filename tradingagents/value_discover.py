@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import json
 import multiprocessing as mp
 import os
 import signal
@@ -23,6 +24,8 @@ import yfinance as yf
 
 
 PACIFIC_TZ = "America/Los_Angeles"
+VALUE_DISCOVER_DEFAULT_LLM_PROVIDER = "openrouter"
+VALUE_DISCOVER_DEFAULT_LLM_MODEL = "google/gemma-4-26b-a4b-it"
 DEFAULT_SCHEDULE_HOUR = 7
 DEFAULT_SCHEDULE_MINUTE = 20
 DEFAULT_UNIVERSE: tuple[str, ...] = (
@@ -110,17 +113,13 @@ def run_llm_analysis_for_candidates(
     per_ticker_timeout_seconds: int | None = None,
 ) -> tuple[list[LLMAnalysisResult], Path]:
     """Run TradingAgents LLM analysis for each Value Discover candidate."""
-    from tradingagents.default_config import DEFAULT_CONFIG
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
     analysis_date = analysis_date or dt.date.today().isoformat()
     output_root = Path(output_dir) / analysis_date / "llm_analysis"
     output_root.mkdir(parents=True, exist_ok=True)
 
-    llm_config = DEFAULT_CONFIG.copy()
-    if config:
-        llm_config.update(config)
-    llm_config.setdefault("checkpoint_enabled", False)
+    llm_config = value_discover_llm_config(config)
 
     factory = graph_factory or TradingAgentsGraph
     use_hard_timeout = (
@@ -198,6 +197,47 @@ def run_llm_analysis_for_candidates(
     summary_path = output_root / "summary.md"
     summary_path.write_text(render_llm_summary(results, analysis_date), encoding="utf-8")
     return results, summary_path
+
+
+def value_discover_llm_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the LLM config used by Value Discover candidate analysis."""
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    llm_config = DEFAULT_CONFIG.copy()
+    if config:
+        llm_config.update(config)
+    else:
+        llm_config.update(
+            {
+                "llm_provider": os.environ.get(
+                    "TRADINGAGENTS_VALUE_DISCOVER_LLM_PROVIDER",
+                    VALUE_DISCOVER_DEFAULT_LLM_PROVIDER,
+                ),
+                "quick_think_llm": os.environ.get(
+                    "TRADINGAGENTS_VALUE_DISCOVER_QUICK_THINK_LLM",
+                    VALUE_DISCOVER_DEFAULT_LLM_MODEL,
+                ),
+                "deep_think_llm": os.environ.get(
+                    "TRADINGAGENTS_VALUE_DISCOVER_DEEP_THINK_LLM",
+                    VALUE_DISCOVER_DEFAULT_LLM_MODEL,
+                ),
+                "backend_url": os.environ.get(
+                    "TRADINGAGENTS_VALUE_DISCOVER_LLM_BACKEND_URL",
+                    "",
+                )
+                or None,
+            }
+        )
+    llm_config.setdefault("checkpoint_enabled", False)
+    return llm_config
+
+
+def _llm_status_fields(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "llm_provider": config.get("llm_provider"),
+        "quick_think_llm": config.get("quick_think_llm"),
+        "deep_think_llm": config.get("deep_think_llm"),
+    }
 
 
 def _raise_llm_timeout(symbol: str, timeout_seconds: int):
@@ -669,47 +709,168 @@ def main() -> None:
     output_dir = Path(os.environ.get("TRADINGAGENTS_VALUE_DISCOVER_DIR", "reports/value_discover"))
     limit = _env_int("TRADINGAGENTS_VALUE_DISCOVER_LIMIT", 10)
     as_of = dt.datetime.now()
-    candidates, markdown_path, csv_path = run_value_discover(
-        limit=limit,
-        output_dir=output_dir,
-        as_of=as_of,
+    run_dir = output_dir / as_of.strftime("%Y-%m-%d")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    status_path = run_dir / "status.json"
+    llm_config = value_discover_llm_config()
+    _write_value_status(
+        status_path,
+        {
+            "status": "running",
+            "analysis_date": as_of.strftime("%Y-%m-%d"),
+            "started_at": as_of.isoformat(),
+            **_llm_status_fields(llm_config),
+            "steps": [
+                {"id": "screen", "label": "Screen universe", "status": "running"},
+                {"id": "public_equity", "label": "Write Public Equity triage", "status": "pending"},
+                {"id": "llm_analysis", "label": "Run LLM analysis", "status": "pending"},
+                {"id": "index_report", "label": "Update report index", "status": "pending"},
+            ],
+        },
     )
-    print(f"Value Discover completed: {len(candidates)} candidates")
-    print(f"Markdown: {markdown_path}")
-    print(f"CSV: {csv_path}")
-    public_equity_json, public_equity_markdown = write_idea_generation_payload(
-        candidates,
-        as_of=as_of,
-        output_dir=output_dir,
-        markdown_path=markdown_path,
-        csv_path=csv_path,
-    )
-    print(f"Public Equity payload: {public_equity_json}")
-    print(f"Public Equity triage: {public_equity_markdown}")
-    llm_enabled = os.environ.get("TRADINGAGENTS_VALUE_DISCOVER_LLM_ENABLED", "true")
-    summary_path = None
-    if llm_enabled.strip().lower() in ("1", "true", "yes", "on"):
-        llm_limit = _env_int("TRADINGAGENTS_VALUE_DISCOVER_LLM_LIMIT", len(candidates))
-        timeout_seconds = _env_int("TRADINGAGENTS_VALUE_DISCOVER_LLM_TIMEOUT_SECONDS", 180)
-        results, summary_path = run_llm_analysis_for_candidates(
-            candidates[:llm_limit],
+    try:
+        candidates, markdown_path, csv_path = run_value_discover(
+            limit=limit,
             output_dir=output_dir,
-            analysis_date=dt.date.today().isoformat(),
-            per_ticker_timeout_seconds=timeout_seconds,
+            as_of=as_of,
         )
-        ok_count = sum(1 for result in results if result.status == "ok")
-        print(f"LLM analysis completed: {ok_count}/{len(results)} succeeded")
-        print(f"LLM summary: {summary_path}")
+        print(f"Value Discover completed: {len(candidates)} candidates")
+        print(f"Markdown: {markdown_path}")
+        print(f"CSV: {csv_path}")
+        _write_value_status(
+            status_path,
+            {
+                "status": "running",
+                "analysis_date": as_of.strftime("%Y-%m-%d"),
+                "started_at": as_of.isoformat(),
+                "candidate_count": len(candidates),
+                "value_discover_markdown": str(markdown_path),
+                "value_discover_csv": str(csv_path),
+                **_llm_status_fields(llm_config),
+                "steps": [
+                    {"id": "screen", "label": "Screen universe", "status": "ok"},
+                    {"id": "public_equity", "label": "Write Public Equity triage", "status": "running"},
+                    {"id": "llm_analysis", "label": "Run LLM analysis", "status": "pending"},
+                    {"id": "index_report", "label": "Update report index", "status": "pending"},
+                ],
+            },
+        )
         public_equity_json, public_equity_markdown = write_idea_generation_payload(
             candidates,
             as_of=as_of,
             output_dir=output_dir,
             markdown_path=markdown_path,
             csv_path=csv_path,
-            llm_summary_path=summary_path,
         )
-    index_path = write_report_index(output_dir.parent)
-    print(f"Report index: {index_path}")
+        print(f"Public Equity payload: {public_equity_json}")
+        print(f"Public Equity triage: {public_equity_markdown}")
+        llm_enabled = os.environ.get("TRADINGAGENTS_VALUE_DISCOVER_LLM_ENABLED", "true")
+        summary_path = None
+        results = []
+        _write_value_status(
+            status_path,
+            {
+                "status": "running",
+                "analysis_date": as_of.strftime("%Y-%m-%d"),
+                "started_at": as_of.isoformat(),
+                "candidate_count": len(candidates),
+                "value_discover_markdown": str(markdown_path),
+                "value_discover_csv": str(csv_path),
+                "public_equity_payload": str(public_equity_json),
+                "public_equity_markdown": str(public_equity_markdown),
+                **_llm_status_fields(llm_config),
+                "steps": [
+                    {"id": "screen", "label": "Screen universe", "status": "ok"},
+                    {"id": "public_equity", "label": "Write Public Equity triage", "status": "ok"},
+                    {"id": "llm_analysis", "label": "Run LLM analysis", "status": "running"},
+                    {"id": "index_report", "label": "Update report index", "status": "pending"},
+                ],
+            },
+        )
+        if llm_enabled.strip().lower() in ("1", "true", "yes", "on"):
+            llm_limit = _env_int("TRADINGAGENTS_VALUE_DISCOVER_LLM_LIMIT", len(candidates))
+            timeout_seconds = _env_int("TRADINGAGENTS_VALUE_DISCOVER_LLM_TIMEOUT_SECONDS", 180)
+            results, summary_path = run_llm_analysis_for_candidates(
+                candidates[:llm_limit],
+                output_dir=output_dir,
+                analysis_date=dt.date.today().isoformat(),
+                config=llm_config,
+                per_ticker_timeout_seconds=timeout_seconds,
+            )
+            ok_count = sum(1 for result in results if result.status == "ok")
+            print(f"LLM analysis completed: {ok_count}/{len(results)} succeeded")
+            print(f"LLM summary: {summary_path}")
+            public_equity_json, public_equity_markdown = write_idea_generation_payload(
+                candidates,
+                as_of=as_of,
+                output_dir=output_dir,
+                markdown_path=markdown_path,
+                csv_path=csv_path,
+                llm_summary_path=summary_path,
+            )
+        _write_value_status(
+            status_path,
+            {
+                "status": "running",
+                "analysis_date": as_of.strftime("%Y-%m-%d"),
+                "started_at": as_of.isoformat(),
+                "candidate_count": len(candidates),
+                "llm_success_count": sum(1 for result in results if result.status == "ok"),
+                "llm_error_count": sum(1 for result in results if result.status == "error"),
+                "value_discover_markdown": str(markdown_path),
+                "value_discover_csv": str(csv_path),
+                "public_equity_payload": str(public_equity_json),
+                "public_equity_markdown": str(public_equity_markdown),
+                "llm_summary": str(summary_path) if summary_path else None,
+                **_llm_status_fields(llm_config),
+                "steps": [
+                    {"id": "screen", "label": "Screen universe", "status": "ok"},
+                    {"id": "public_equity", "label": "Write Public Equity triage", "status": "ok"},
+                    {"id": "llm_analysis", "label": "Run LLM analysis", "status": "ok"},
+                    {"id": "index_report", "label": "Update report index", "status": "running"},
+                ],
+            },
+        )
+        index_path = write_report_index(output_dir.parent)
+        print(f"Report index: {index_path}")
+        _write_value_status(
+            status_path,
+            {
+                "status": "ok",
+                "analysis_date": as_of.strftime("%Y-%m-%d"),
+                "started_at": as_of.isoformat(),
+                "completed_at": dt.datetime.now().isoformat(),
+                "candidate_count": len(candidates),
+                "llm_success_count": sum(1 for result in results if result.status == "ok"),
+                "llm_error_count": sum(1 for result in results if result.status == "error"),
+                "value_discover_markdown": str(markdown_path),
+                "value_discover_csv": str(csv_path),
+                "public_equity_payload": str(public_equity_json),
+                "public_equity_markdown": str(public_equity_markdown),
+                "llm_summary": str(summary_path) if summary_path else None,
+                "report_index": str(index_path),
+                **_llm_status_fields(llm_config),
+                "steps": [
+                    {"id": "screen", "label": "Screen universe", "status": "ok"},
+                    {"id": "public_equity", "label": "Write Public Equity triage", "status": "ok"},
+                    {"id": "llm_analysis", "label": "Run LLM analysis", "status": "ok"},
+                    {"id": "index_report", "label": "Update report index", "status": "ok"},
+                ],
+            },
+        )
+    except Exception as exc:
+        _write_value_status(
+            status_path,
+            {
+                "status": "error",
+                "analysis_date": as_of.strftime("%Y-%m-%d"),
+                "started_at": as_of.isoformat(),
+                "completed_at": dt.datetime.now().isoformat(),
+                "error": str(exc),
+                **_llm_status_fields(llm_config),
+            },
+        )
+        raise
 
 
 def _env_int(name: str, default: int) -> int:
@@ -720,6 +881,10 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _write_value_status(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

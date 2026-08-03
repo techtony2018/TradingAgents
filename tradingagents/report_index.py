@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import csv
 from pathlib import Path
 from typing import Any
 
@@ -21,16 +22,38 @@ def build_report_index(report_root: Path | str = "reports") -> dict[str, Any]:
             public_equity_json = sorted(date_dir.glob("public_equity_idea_generation_*.json"), reverse=True)
             public_equity_md = sorted(date_dir.glob("public_equity_idea_generation_*.md"), reverse=True)
             llm_summary = date_dir / "llm_analysis" / "summary.md"
+            status_path = date_dir / "status.json"
             if not markdowns and not csvs and not public_equity_json:
                 continue
+            status = _load_json(status_path) if status_path.exists() else {}
+            csv_summary = _summarize_value_csv(csvs[0]) if csvs else {}
+            llm_counts = _summarize_llm_summary(llm_summary) if llm_summary.exists() else {}
+            public_equity_summary = (
+                _summarize_public_equity_payload(public_equity_json[0])
+                if public_equity_json
+                else {"metrics": [], "workflow_route_count": 0, "top_workflow_routes": []}
+            )
             runs.append(
                 {
                     "date": date_dir.name,
+                    "status": status.get("status") or "ok",
+                    "error": status.get("error"),
+                    "started_at": status.get("started_at"),
+                    "completed_at": status.get("completed_at"),
+                    "candidate_count": status.get("candidate_count", csv_summary.get("candidate_count", 0)),
+                    "top_candidates": csv_summary.get("top_candidates", []),
+                    "llm_success_count": status.get("llm_success_count", llm_counts.get("ok", 0)),
+                    "llm_error_count": status.get("llm_error_count", llm_counts.get("error", 0)),
+                    "metrics": public_equity_summary["metrics"],
+                    "public_equity_workflow_route_count": public_equity_summary["workflow_route_count"],
+                    "top_public_equity_routes": public_equity_summary["top_workflow_routes"],
+                    "steps": status.get("steps", []),
                     "value_discover_markdown": _path(markdowns[0] if markdowns else None),
                     "value_discover_csv": _path(csvs[0] if csvs else None),
                     "public_equity_payload": _path(public_equity_json[0] if public_equity_json else None),
                     "public_equity_markdown": _path(public_equity_md[0] if public_equity_md else None),
                     "llm_summary": _path(llm_summary if llm_summary.exists() else None),
+                    "status_json": _path(status_path if status_path.exists() else None),
                 }
             )
     stock_runs: list[dict[str, Any]] = []
@@ -89,3 +112,63 @@ def write_report_index(report_root: Path | str = "reports") -> Path:
 
 def _path(path: Path | None) -> str | None:
     return str(path) if path else None
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _summarize_value_csv(path: Path) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    except OSError:
+        return {"candidate_count": 0, "top_candidates": []}
+    top_candidates = [
+        {
+            "symbol": row.get("symbol", ""),
+            "score": row.get("score", ""),
+            "thesis": row.get("thesis", ""),
+        }
+        for row in rows[:5]
+    ]
+    return {"candidate_count": len(rows), "top_candidates": top_candidates}
+
+
+def _summarize_llm_summary(path: Path) -> dict[str, int]:
+    counts = {"ok": 0, "error": 0}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return counts
+    for line in lines:
+        if not line.startswith("|") or "---" in line or "Ticker" in line:
+            continue
+        parts = [part.strip().lower() for part in line.strip("|").split("|")]
+        if len(parts) < 2:
+            continue
+        status = parts[1]
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def _summarize_public_equity_payload(path: Path) -> dict[str, Any]:
+    payload = _load_json(path)
+    metrics = payload.get("snapshot")
+    routes: list[dict[str, Any]] = []
+    for tab in payload.get("tabs", []):
+        if tab.get("id") != "workflow-router":
+            continue
+        for module in tab.get("modules", []):
+            if module.get("type") == "workflow_routes":
+                routes = module.get("rows", [])
+                break
+    return {
+        "metrics": metrics if isinstance(metrics, list) else [],
+        "workflow_route_count": len(routes),
+        "top_workflow_routes": routes[:8],
+    }

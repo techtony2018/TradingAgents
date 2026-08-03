@@ -178,15 +178,29 @@ def _fetch_openrouter_models() -> List[Tuple[str, str]]:
         return []
 
 
-def select_openrouter_model() -> str:
-    """Select an OpenRouter model from the newest available, or enter a custom ID."""
+def select_openrouter_model(mode: str = "deep") -> str:
+    """Select an OpenRouter model from curated and live options, or enter a custom ID."""
+    curated = [
+        (display, value)
+        for display, value in get_model_options("openrouter", mode)
+        if value != "custom"
+    ]
+    curated_ids = {value for _, value in curated}
     models = _fetch_openrouter_models()
+    live_models = [
+        (name, model_id)
+        for name, model_id in models
+        if model_id not in curated_ids
+    ]
 
-    choices = [questionary.Choice(name, value=mid) for name, mid in models[:5]]
+    choices = [
+        questionary.Choice(name, value=model_id)
+        for name, model_id in [*curated, *live_models[:5]]
+    ]
     choices.append(questionary.Choice("Custom model ID", value="custom"))
 
     choice = questionary.select(
-        "Select OpenRouter Model (latest available):",
+        "Select OpenRouter Model:",
         choices=choices,
         instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
         style=questionary.Style([
@@ -216,7 +230,7 @@ def _prompt_custom_model_id() -> str:
 def _select_model(provider: str, mode: str) -> str:
     """Select a model for the given provider and mode (quick/deep)."""
     if provider.lower() == "openrouter":
-        return select_openrouter_model()
+        return select_openrouter_model(mode)
 
     if provider.lower() == "azure":
         return questionary.text(

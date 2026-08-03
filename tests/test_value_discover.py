@@ -11,6 +11,7 @@ from tradingagents.value_discover import (
     render_markdown,
     run_llm_analysis_for_candidates,
     run_value_discover,
+    value_discover_llm_config,
 )
 
 
@@ -133,6 +134,23 @@ def test_llm_analysis_receives_discovered_candidates(tmp_path):
     assert results[0].report_path.exists()
     assert "Final decision" in results[0].report_path.read_text(encoding="utf-8")
     assert "CHEAP" in summary_path.read_text(encoding="utf-8")
+
+
+def test_value_discover_defaults_to_openrouter_gemma(monkeypatch):
+    for key in (
+        "TRADINGAGENTS_VALUE_DISCOVER_LLM_PROVIDER",
+        "TRADINGAGENTS_VALUE_DISCOVER_QUICK_THINK_LLM",
+        "TRADINGAGENTS_VALUE_DISCOVER_DEEP_THINK_LLM",
+        "TRADINGAGENTS_VALUE_DISCOVER_LLM_BACKEND_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    config = value_discover_llm_config()
+
+    assert config["llm_provider"] == "openrouter"
+    assert config["quick_think_llm"] == "google/gemma-4-26b-a4b-it"
+    assert config["deep_think_llm"] == "google/gemma-4-26b-a4b-it"
+    assert config["backend_url"] is None
 
 
 def test_llm_analysis_records_timeout(tmp_path):

@@ -6,8 +6,10 @@ import argparse
 import datetime as dt
 import html
 import json
+import os
 import subprocess
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -19,6 +21,8 @@ from tradingagents.report_index import build_report_index, write_report_index
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORT_ROOT = PROJECT_ROOT / "reports"
+VALUE_DISCOVER_LOCK = REPORT_ROOT / "value_discover.lock"
+VALUE_DISCOVER_PROCESS_LOCK = threading.Lock()
 WEB_PROVIDER_OPTIONS = [
     ("OpenAI", "openai"),
     ("Google", "google"),
@@ -29,6 +33,7 @@ WEB_PROVIDER_OPTIONS = [
     ("GLM", "glm"),
     ("MiniMax", "minimax"),
     ("NVIDIA NIM", "nvidia"),
+    ("OpenRouter", "openrouter"),
     ("Ollama", "ollama"),
 ]
 
@@ -37,7 +42,7 @@ class TradingAgentsHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            self._send_html(render_home(REPORT_ROOT))
+            self._send_html(render_home(REPORT_ROOT, parsed.query))
             return
         if parsed.path == "/api/reports":
             write_report_index(REPORT_ROOT)
@@ -59,14 +64,9 @@ class TradingAgentsHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/run/value-discover":
-            subprocess.Popen(
-                [sys.executable, "-m", "tradingagents.value_discover"],
-                cwd=PROJECT_ROOT,
-                stdout=(REPORT_ROOT / "value_discover.web.log").open("ab"),
-                stderr=subprocess.STDOUT,
-            )
+            started = _start_value_discover_job()
             self.send_response(303)
-            self.send_header("Location", "/?started=1")
+            self.send_header("Location", "/?started=1" if started else "/?value_running=1")
             self.end_headers()
             return
         if parsed.path == "/run/stock-analysis":
@@ -145,21 +145,28 @@ class TradingAgentsHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-def render_home(report_root: Path) -> str:
+def render_home(report_root: Path, query: str = "") -> str:
     write_report_index(report_root)
     index = build_report_index(report_root)
     latest = index.get("latest_value_discover")
     latest_stock = index.get("latest_stock_analysis")
+    value_discover_running = _value_discover_is_running() or (
+        latest is not None and latest.get("status") in {"running", "queued"}
+    )
     rows = []
     for run in index.get("value_discover_runs", []):
         rows.append(
             "<tr>"
             f"<td>{_e(run['date'])}</td>"
+            f"<td>{_status_badge(run.get('status', 'ok'))}</td>"
+            f"<td>{_e(run.get('candidate_count', 0))}</td>"
+            f"<td>{_e(run.get('llm_success_count', 0))}/{_e(run.get('llm_error_count', 0))}</td>"
             f"<td>{_link(run.get('value_discover_markdown'), 'Markdown')}</td>"
             f"<td>{_link(run.get('value_discover_csv'), 'CSV')}</td>"
             f"<td>{_link(run.get('public_equity_markdown'), 'Public Equity')}</td>"
             f"<td>{_link(run.get('public_equity_payload'), 'Payload')}</td>"
             f"<td>{_link(run.get('llm_summary'), 'LLM Summary')}</td>"
+            f"<td>{_link(run.get('status_json'), 'Status')}</td>"
             "</tr>"
         )
     stock_rows = []
@@ -178,11 +185,15 @@ def render_home(report_root: Path) -> str:
         )
     latest_panel = render_latest_panel(latest)
     stock_panel = render_stock_panel(latest_stock)
+    value_discover_control = render_value_discover_control(
+        running=value_discover_running,
+        started="started=1" in query,
+        already_running="value_running=1" in query,
+    )
     today = dt.date.today().isoformat()
     provider_options = _provider_options(DEFAULT_CONFIG["llm_provider"])
     quick_options = _model_options("quick", DEFAULT_CONFIG["llm_provider"], DEFAULT_CONFIG["quick_think_llm"])
     deep_options = _model_options("deep", DEFAULT_CONFIG["llm_provider"], DEFAULT_CONFIG["deep_think_llm"])
-    started = "Run started. Refresh in a minute for the new report." if "started=1" in "" else ""
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -198,13 +209,16 @@ def render_home(report_root: Path) -> str:
     h2 {{ margin-top:0; }}
     main {{ max-width: 1180px; margin: 0 auto; padding: 22px; }}
     .toolbar {{ display:flex; gap:10px; align-items:center; }}
+    .section-header {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }}
+    .section-header h2 {{ margin:0; }}
+    .notice {{ border:1px solid #bfdbfe; background:#eff6ff; color:#1e40af; border-radius:6px; padding:10px 12px; margin:10px 0 0; }}
     .analysis-form {{ display:grid; grid-template-columns: minmax(120px, .7fr) minmax(150px, .8fr) minmax(150px, .9fr) minmax(220px, 1.4fr) minmax(220px, 1.4fr) auto; gap:12px; align-items:end; }}
     label span {{ color:var(--muted); display:block; font-size:12px; margin-bottom:4px; }}
     input, select {{ width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; font:inherit; background:white; }}
     button, .button {{ border:1px solid var(--accent); background:var(--accent); color:white; border-radius:6px; padding:8px 12px; font-weight:600; cursor:pointer; text-decoration:none; white-space:nowrap; }}
     button:disabled {{ opacity:.58; cursor:progress; }}
     .secondary {{ background:white; color:var(--accent); }}
-    .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:18px; }}
+    .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:18px; overflow:hidden; }}
     .grid {{ display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:12px; }}
     .metric {{ border:1px solid var(--line); border-radius:6px; padding:12px; min-height:76px; }}
     .metric span {{ color:var(--muted); display:block; font-size:12px; }}
@@ -224,14 +238,13 @@ def render_home(report_root: Path) -> str:
     .status-pending, .status-queued {{ background:#eef2f7; color:#475569; }}
     .events {{ margin:12px 0 0; padding-left:18px; color:var(--muted); max-height:140px; overflow:auto; }}
     @media (max-width: 1060px) {{ .analysis-form {{ grid-template-columns:1fr 1fr; }} .steps {{ grid-template-columns:1fr 1fr; }} }}
-    @media (max-width: 780px) {{ header {{ display:block; }} .toolbar {{ margin-top:12px; }} .grid {{ grid-template-columns:1fr 1fr; }} .analysis-form {{ grid-template-columns:1fr; }} .steps {{ grid-template-columns:1fr; }} table {{ font-size:12px; }} }}
+    @media (max-width: 780px) {{ main {{ padding:14px; }} header {{ display:block; padding:16px; }} .toolbar {{ margin-top:12px; }} .section-header {{ align-items:flex-start; flex-direction:column; }} .grid {{ grid-template-columns:1fr 1fr; }} .analysis-form {{ grid-template-columns:1fr; }} .steps {{ grid-template-columns:1fr; }} .metric strong {{ font-size:18px; overflow-wrap:anywhere; }} table {{ display:block; overflow-x:auto; font-size:12px; white-space:nowrap; }} }}
   </style>
 </head>
 <body>
   <header>
     <h1>TradingAgents Reports</h1>
     <div class="toolbar">
-      <form method="post" action="/run/value-discover"><button type="submit">Run Value Discover</button></form>
       <a class="button secondary" href="/api/reports">API</a>
     </div>
   </header>
@@ -264,6 +277,7 @@ def render_home(report_root: Path) -> str:
       <p class="muted">Runs in the background and writes a full Markdown report bundle. Each run gets its own unique folder.</p>
     </section>
     {stock_panel}
+    {value_discover_control}
     {latest_panel}
     <section class="panel">
       <h2>Stock Analysis History</h2>
@@ -275,13 +289,23 @@ def render_home(report_root: Path) -> str:
     <section class="panel">
       <h2>Report History</h2>
       <table>
-        <thead><tr><th>Date</th><th>Shortlist</th><th>CSV</th><th>Public Equity</th><th>Payload</th><th>LLM</th></tr></thead>
-        <tbody>{''.join(rows) or '<tr><td colspan="6">No reports found.</td></tr>'}</tbody>
+        <thead><tr><th>Date</th><th>Status</th><th>Candidates</th><th>LLM OK/Error</th><th>Shortlist</th><th>CSV</th><th>Public Equity</th><th>Payload</th><th>LLM</th><th>Status JSON</th></tr></thead>
+        <tbody>{''.join(rows) or '<tr><td colspan="10">No reports found.</td></tr>'}</tbody>
       </table>
     </section>
     <p class="muted">Outputs are research support, not financial advice or order recommendations.</p>
   </main>
   <script>
+    const valueDiscoverForm = document.querySelector("[data-value-discover-form]");
+    if (valueDiscoverForm) {{
+      valueDiscoverForm.addEventListener("submit", () => {{
+        const button = valueDiscoverForm.querySelector("[data-value-discover-button]");
+        if (button) {{
+          button.disabled = true;
+          button.textContent = "Starting...";
+        }}
+      }});
+    }}
     const form = document.querySelector("[data-analysis-form]");
     if (form) {{
       const provider = form.querySelector("select[name='llm_provider']");
@@ -306,7 +330,7 @@ def render_home(report_root: Path) -> str:
         }}
       }});
     }}
-    if (document.querySelector(".status-running, .status-queued")) {{
+    if (document.querySelector(".status-running, .status-queued, [data-auto-refresh]")) {{
       setTimeout(() => window.location.reload(), 5000);
     }}
   </script>
@@ -347,14 +371,50 @@ def render_stock_panel(latest: dict | None) -> str:
     )
 
 
+def render_value_discover_control(
+    *,
+    running: bool,
+    started: bool = False,
+    already_running: bool = False,
+) -> str:
+    disabled = " disabled" if running else ""
+    label = "Value Discover Running..." if running else "Run Value Discover"
+    notice = ""
+    if started:
+        notice = (
+            "<p class='notice' data-auto-refresh>"
+            "Value Discover started. This page will refresh while the run is active."
+            "</p>"
+        )
+    elif already_running or running:
+        notice = (
+            "<p class='notice' data-auto-refresh>"
+            "Value Discover is already running. Duplicate starts are blocked."
+            "</p>"
+        )
+    return (
+        "<section class='panel'>"
+        "<div class='section-header'>"
+        "<h2>Value Discover</h2>"
+        "<form method='post' action='/run/value-discover' data-value-discover-form>"
+        f"<button type='submit' data-value-discover-button{disabled}>{_e(label)}</button>"
+        "</form>"
+        "</div>"
+        "<p class='muted'>Runs the undervaluation screen, Public Equity workflow routing, and optional LLM analysis in the background.</p>"
+        f"{notice}"
+        "</section>"
+    )
+
+
 def render_latest_panel(latest: dict | None) -> str:
     if not latest:
-        return "<section class='panel'><h2>Latest Run</h2><p>No Value Discover runs found.</p></section>"
+        return "<section class='panel'><h2>Value Discover Results</h2><p>No Value Discover runs found.</p></section>"
     payload_path = latest.get("public_equity_payload")
     payload = _load_json(Path(payload_path)) if payload_path else None
     metrics = ""
-    if payload:
-        for item in payload.get("snapshot", []):
+    snapshot = latest.get("metrics") or (payload.get("snapshot", []) if payload else [])
+    if snapshot:
+        for item in snapshot:
             metrics += (
                 "<div class='metric'>"
                 f"<span>{_e(item.get('label', 'Metric'))}</span>"
@@ -362,17 +422,66 @@ def render_latest_panel(latest: dict | None) -> str:
                 f"<span>{_e(item.get('unit', ''))}</span>"
                 "</div>"
             )
+    top_rows = "".join(
+        "<tr>"
+        f"<td>{_e(item.get('symbol', ''))}</td>"
+        f"<td>{_e(item.get('score', ''))}</td>"
+        f"<td>{_e(_short(item.get('thesis', ''), 110))}</td>"
+        "</tr>"
+        for item in latest.get("top_candidates", [])
+    )
+    steps = "".join(
+        "<div class='step'>"
+        f"{_status_badge(step.get('status', 'pending'))}"
+        f"<strong>{_e(step.get('label', step.get('id', 'Step')))}</strong>"
+        "</div>"
+        for step in latest.get("steps", [])
+    )
+    steps_html = f"<div class='steps'>{steps}</div>" if steps else ""
+    top_candidates_html = (
+        "<table><thead><tr><th>Ticker</th><th>Score</th><th>Thesis</th></tr></thead>"
+        f"<tbody>{top_rows}</tbody></table>"
+        if top_rows
+        else '<p class="muted">No candidates in the latest Value Discover run.</p>'
+    )
+    route_rows = "".join(
+        "<tr>"
+        f"<td>{_e(route.get('ticker', ''))}</td>"
+        f"<td>{_e(route.get('priority', ''))}</td>"
+        f"<td>{_e(route.get('workflow', ''))}</td>"
+        f"<td>{_e(_short(route.get('why', ''), 96))}</td>"
+        f"<td>{_e('yes' if route.get('requires_llm') else 'no')}</td>"
+        "</tr>"
+        for route in latest.get("top_public_equity_routes", [])
+    )
+    route_table = (
+        "<table><thead><tr><th>Ticker</th><th>Priority</th><th>Workflow</th><th>Why</th><th>LLM</th></tr></thead>"
+        f"<tbody>{route_rows}</tbody></table>"
+        if route_rows
+        else ""
+    )
     fallback_metric = "<div class='metric'><span>Status</span><strong>Indexed</strong></div>"
+    status_metric = (
+        f"<div class='metric'><span>Status</span><strong>{_status_badge(latest.get('status', 'ok'))}</strong></div>"
+        f"<div class='metric'><span>Candidates</span><strong>{_e(latest.get('candidate_count', 0))}</strong></div>"
+        f"<div class='metric'><span>LLM OK</span><strong>{_e(latest.get('llm_success_count', 0))}</strong></div>"
+        f"<div class='metric'><span>LLM Errors</span><strong>{_e(latest.get('llm_error_count', 0))}</strong></div>"
+        f"<div class='metric'><span>PE Routes</span><strong>{_e(latest.get('public_equity_workflow_route_count', 0))}</strong></div>"
+    )
     return (
         "<section class='panel'>"
-        f"<h2>Latest Run: {_e(latest['date'])}</h2>"
+        f"<h2>Value Discover Results: {_e(latest['date'])}</h2>"
         "<div class='grid'>"
-        f"{metrics or fallback_metric}"
+        f"{status_metric}{metrics or fallback_metric}"
         "</div>"
+        f"{steps_html}"
+        f"{top_candidates_html}"
+        f"{route_table}"
         "<p>"
         f"{_link(latest.get('value_discover_markdown'), 'Open shortlist')} &nbsp; "
         f"{_link(latest.get('public_equity_markdown'), 'Open Public Equity triage')} &nbsp; "
-        f"{_link(latest.get('llm_summary'), 'Open LLM summary')}"
+        f"{_link(latest.get('llm_summary'), 'Open LLM summary')} &nbsp; "
+        f"{_link(latest.get('status_json'), 'Open status')}"
         "</p>"
         "</section>"
     )
@@ -401,6 +510,72 @@ def _is_allowed_report_path(path: Path) -> bool:
         return False
 
 
+def _start_value_discover_job() -> bool:
+    with VALUE_DISCOVER_PROCESS_LOCK:
+        if _value_discover_is_running():
+            return False
+        REPORT_ROOT.mkdir(parents=True, exist_ok=True)
+        command = [sys.executable, "-m", "tradingagents.value_discover"]
+        process = subprocess.Popen(
+            command,
+            cwd=PROJECT_ROOT,
+            stdout=(REPORT_ROOT / "value_discover.web.log").open("ab"),
+            stderr=subprocess.STDOUT,
+        )
+        VALUE_DISCOVER_LOCK.write_text(
+            json.dumps(
+                {
+                    "pid": process.pid,
+                    "started_at": dt.datetime.now().isoformat(),
+                    "command": command,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        threading.Thread(
+            target=_clear_value_discover_lock_when_done,
+            args=(process, VALUE_DISCOVER_LOCK),
+            daemon=True,
+        ).start()
+        return True
+
+
+def _value_discover_is_running() -> bool:
+    if not VALUE_DISCOVER_LOCK.exists():
+        return False
+    try:
+        payload = json.loads(VALUE_DISCOVER_LOCK.read_text(encoding="utf-8"))
+        pid = int(payload.get("pid", 0))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        VALUE_DISCOVER_LOCK.unlink(missing_ok=True)
+        return False
+    if pid > 0 and _pid_is_running(pid):
+        return True
+    VALUE_DISCOVER_LOCK.unlink(missing_ok=True)
+    return False
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _clear_value_discover_lock_when_done(process: subprocess.Popen, lock_path: Path) -> None:
+    process.wait()
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if payload.get("pid") == process.pid:
+        lock_path.unlink(missing_ok=True)
+
+
 def _link(path: str | None, label: str) -> str:
     if not path:
         return "<span class='muted'>N/A</span>"
@@ -420,7 +595,7 @@ def _e(value: object) -> str:
 
 def _short(value: object, limit: int = 80) -> str:
     text = str(value).replace("\n", " ").strip()
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def _provider_options(selected: str) -> str:

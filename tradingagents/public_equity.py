@@ -18,6 +18,58 @@ from tradingagents.value_discover import ValueCandidate
 
 PAYLOAD_KIND = "public_equity_investing_dashboard.v1"
 PLUGIN_ID = "public-equity-investing"
+PLUGIN_VERSION = "0.1.29"
+
+PUBLIC_EQUITY_WORKFLOWS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "company-tearsheet",
+        "label": "Company Tearsheet",
+        "token_saver_role": "Materialize issuer facts once so later work reuses a compact baseline.",
+        "requires_llm": False,
+    },
+    {
+        "id": "comps-valuation",
+        "label": "Comps Valuation",
+        "token_saver_role": "Use structured valuation fields before asking for valuation narrative.",
+        "requires_llm": False,
+    },
+    {
+        "id": "earnings-preview",
+        "label": "Earnings Preview",
+        "token_saver_role": "Route estimate-risk questions into an earnings-specific template.",
+        "requires_llm": True,
+    },
+    {
+        "id": "catalyst-calendar",
+        "label": "Catalyst Calendar",
+        "token_saver_role": "Track timing and evidence gaps as rows before generating commentary.",
+        "requires_llm": False,
+    },
+    {
+        "id": "thesis-tracker",
+        "label": "Thesis Tracker",
+        "token_saver_role": "Persist thesis, disconfirming evidence, and kill criteria across runs.",
+        "requires_llm": False,
+    },
+    {
+        "id": "long-short-pitch",
+        "label": "Long/Short Pitch",
+        "token_saver_role": "Escalate only high-upside candidates to model-heavy pitch writing.",
+        "requires_llm": True,
+    },
+    {
+        "id": "scenario-sensitivity-generator",
+        "label": "Scenario Sensitivity",
+        "token_saver_role": "Represent uncertainty as scenario rows before interpretation.",
+        "requires_llm": False,
+    },
+    {
+        "id": "portfolio-risk-management",
+        "label": "Portfolio Risk Management",
+        "token_saver_role": "Summarize liquidity, valuation, and technical flags before sizing.",
+        "requires_llm": False,
+    },
+)
 
 
 def build_idea_generation_payload(
@@ -62,6 +114,7 @@ def build_idea_generation_payload(
         },
         "metadata": {
             "payload_stage": "support",
+            "plugin_version": PLUGIN_VERSION,
             "freeze_time": as_of.isoformat(),
             "source_posture": "TradingAgents quantitative screen; premium Public Equity source connectors not verified in-process",
             "readiness_label": "Research-priority triage, not recommendation",
@@ -79,6 +132,7 @@ def build_idea_generation_payload(
             {"label": "Advance", "value": advance_count, "unit": "names"},
             {"label": "Watchlist", "value": watchlist_count, "unit": "names"},
             {"label": "Evidence gaps", "value": evidence_gap_count, "unit": "names"},
+            {"label": "PE routes", "value": _workflow_route_count(rows), "unit": "steps"},
         ],
         "tabs": [
             {
@@ -145,6 +199,30 @@ def build_idea_generation_payload(
                     },
                 ],
             },
+            {
+                "id": "workflow-router",
+                "label": "Workflow Router",
+                "modules": [
+                    {
+                        "type": "workflow_catalog",
+                        "title": "Available Public Equity Investing workflows",
+                        "rows": list(PUBLIC_EQUITY_WORKFLOWS),
+                    },
+                    {
+                        "type": "workflow_routes",
+                        "title": "Deterministic candidate routing",
+                        "columns": [
+                            "ticker",
+                            "priority",
+                            "workflow",
+                            "why",
+                            "requires_llm",
+                            "token_saver_role",
+                        ],
+                        "rows": _workflow_routes(rows),
+                    },
+                ],
+            },
         ],
         "sources": [
             {
@@ -168,6 +246,7 @@ def build_idea_generation_payload(
                 "title": "Public Equity Investing plugin workflow",
                 "type": "codex_plugin",
                 "status": "installed_skills_available_connectors_unverified",
+                "version": PLUGIN_VERSION,
                 "as_of": as_of.date().isoformat(),
             },
         ],
@@ -180,6 +259,7 @@ def build_idea_generation_payload(
             "final_recommendation": False,
             "source_connectors_verified": False,
             "preserves_candidate_queue": True,
+            "deterministic_workflow_routing": True,
         },
     }
 
@@ -244,6 +324,28 @@ def render_idea_generation_markdown(payload: dict[str, Any]) -> str:
             "",
             payload["metadata"]["source_posture"],
             "",
+            "## Token-Saving Public Equity Routes",
+            "",
+            "| Ticker | Priority | Workflow | Why | LLM Needed |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    workflow_rows = payload["tabs"][3]["modules"][1]["rows"]
+    for route in workflow_rows:
+        lines.append(
+            "| {ticker} | {priority} | {workflow} | {why} | {requires_llm} |".format(
+                ticker=_md(route["ticker"]),
+                priority=_md(route["priority"]),
+                workflow=_md(route["workflow"]),
+                why=_md(route["why"]),
+                requires_llm="yes" if route["requires_llm"] else "no",
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "These routes are deterministic Public Equity workflow handoffs. Use them to reuse structured context and call LLMs only for judgment-heavy steps.",
+            "",
             "## Missing Evidence",
             "",
         ]
@@ -277,6 +379,7 @@ def _candidate_row(candidate: ValueCandidate, rank: int) -> dict[str, Any]:
         "what_would_make_it_investable": "Source-backed earnings durability, catalyst timing, and valuation support.",
         "what_would_kill_it": "Broken fundamentals, value trap evidence, weak liquidity, or adverse near-term catalyst.",
         "next_workflow": _next_workflow(candidate),
+        "workflow_routes": _candidate_workflow_routes(candidate, bucket),
         "missing_evidence": "Needs source-backed exposure proof, consensus/estimate context, ownership/positioning, and catalyst validation.",
         "raw_candidate": asdict(candidate),
     }
@@ -312,11 +415,104 @@ def _first_rejection(candidate: ValueCandidate) -> str:
 
 
 def _next_workflow(candidate: ValueCandidate) -> str:
-    if candidate.score >= 72:
-        return "company-tearsheet -> thesis-tracker"
+    routes = _candidate_workflow_routes(candidate, _triage_bucket(candidate.score))
+    return " -> ".join(route["workflow"] for route in routes[:3])
+
+
+def _candidate_workflow_routes(candidate: ValueCandidate, bucket: str) -> list[dict[str, Any]]:
+    routes = [
+        _route(
+            candidate,
+            "company-tearsheet",
+            "P0",
+            "Build the compact issuer baseline before any model-heavy analysis.",
+        ),
+        _route(
+            candidate,
+            "comps-valuation",
+            "P0",
+            "Reuse existing valuation multiples from the quantitative screen.",
+        ),
+        _route(
+            candidate,
+            "portfolio-risk-management",
+            "P1",
+            "Check liquidity, valuation, and technical risk before sizing or trading.",
+        ),
+    ]
+    if bucket.startswith("A"):
+        routes.append(
+            _route(
+                candidate,
+                "thesis-tracker",
+                "P1",
+                "High-score candidates should persist thesis, kill criteria, and open evidence gaps.",
+            )
+        )
     if candidate.target_upside_pct is not None and candidate.target_upside_pct >= 0.25:
-        return "company-tearsheet -> long-short-pitch"
-    return "company-tearsheet -> earnings-preview"
+        routes.append(
+            _route(
+                candidate,
+                "long-short-pitch",
+                "P2",
+                "High target upside merits a pitch outline only after baseline and valuation checks.",
+            )
+        )
+        routes.append(
+            _route(
+                candidate,
+                "scenario-sensitivity-generator",
+                "P2",
+                "Upside depends on scenario assumptions that can be tabulated first.",
+            )
+        )
+    if candidate.target_upside_pct is None or "missing" in _expectations_risk(candidate).lower():
+        routes.append(
+            _route(
+                candidate,
+                "earnings-preview",
+                "P2",
+                "Missing consensus or expectations context should route to earnings-specific questions.",
+            )
+        )
+    if candidate.rsi_14 is not None or candidate.caveats:
+        routes.append(
+            _route(
+                candidate,
+                "catalyst-calendar",
+                "P2",
+                "Timing, technical setup, and rejection risks should be tracked as catalyst gates.",
+            )
+        )
+    return routes
+
+
+def _route(candidate: ValueCandidate, workflow_id: str, priority: str, why: str) -> dict[str, Any]:
+    workflow = _workflow(workflow_id)
+    return {
+        "ticker": candidate.symbol,
+        "priority": priority,
+        "workflow": workflow_id,
+        "workflow_label": workflow["label"],
+        "why": why,
+        "requires_llm": workflow["requires_llm"],
+        "token_saver_role": workflow["token_saver_role"],
+    }
+
+
+def _workflow(workflow_id: str) -> dict[str, Any]:
+    for workflow in PUBLIC_EQUITY_WORKFLOWS:
+        if workflow["id"] == workflow_id:
+            return workflow
+    raise KeyError(workflow_id)
+
+
+def _workflow_routes(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [route for row in rows for route in row.get("workflow_routes", [])]
+
+
+def _workflow_route_count(rows: Sequence[dict[str, Any]]) -> int:
+    return sum(len(row.get("workflow_routes", [])) for row in rows)
 
 
 def _md(value: object) -> str:

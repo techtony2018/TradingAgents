@@ -45,11 +45,22 @@ def test_public_equity_payload_matches_dashboard_contract():
     assert payload["kind"] == PAYLOAD_KIND
     assert payload["mode"] == "idea_generation"
     assert payload["metadata"]["payload_stage"] == "support"
+    assert payload["metadata"]["plugin_version"] == "0.1.29"
     assert payload["qa"]["final_recommendation"] is False
+    assert payload["qa"]["deterministic_workflow_routing"] is True
     row = payload["tabs"][1]["modules"][0]["rows"][0]
     assert row["ticker"] == "CHEAP"
     assert row["triage_bucket"].startswith("A")
-    assert row["next_workflow"] == "company-tearsheet -> thesis-tracker"
+    assert row["next_workflow"] == "company-tearsheet -> comps-valuation -> portfolio-risk-management"
+    assert [route["workflow"] for route in row["workflow_routes"][:3]] == [
+        "company-tearsheet",
+        "comps-valuation",
+        "portfolio-risk-management",
+    ]
+    router = payload["tabs"][3]["modules"]
+    assert router[0]["type"] == "workflow_catalog"
+    assert router[1]["type"] == "workflow_routes"
+    assert any(route["workflow"] == "long-short-pitch" for route in router[1]["rows"])
 
 
 def test_public_equity_payload_writer_materializes_json_and_markdown(tmp_path):
@@ -64,4 +75,6 @@ def test_public_equity_payload_writer_materializes_json_and_markdown(tmp_path):
     assert json_path.exists()
     assert markdown_path.exists()
     assert json.loads(json_path.read_text(encoding="utf-8"))["kind"] == PAYLOAD_KIND
-    assert "Public Equity Triage" in markdown_path.read_text(encoding="utf-8")
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "Public Equity Triage" in markdown
+    assert "Token-Saving Public Equity Routes" in markdown

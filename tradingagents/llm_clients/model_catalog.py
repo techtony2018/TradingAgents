@@ -94,6 +94,28 @@ _NVIDIA_MODELS: Dict[str, List[ModelOption]] = {
 }
 
 
+_OPENROUTER_MODELS: Dict[str, List[ModelOption]] = {
+    "quick": [
+        ("OpenRouter Free Router - Free-tier model router", "openrouter/free"),
+        ("OpenAI GPT OSS 20B - OpenRouter open-weight reasoning/coding", "openai/gpt-oss-20b"),
+        ("OpenAI GPT OSS 120B - OpenRouter larger open-weight reasoning model", "openai/gpt-oss-120b"),
+        ("Qwen3 Coder - OpenRouter agentic coding model", "qwen/qwen3-coder"),
+        ("Google Gemma 4 26B A4B IT - OpenRouter efficient instruction model", "google/gemma-4-26b-a4b-it"),
+        ("Custom model ID", "custom"),
+    ],
+    "deep": [
+        ("NVIDIA Nemotron 3 Ultra 550B A55B - OpenRouter frontier reasoning MoE", "nvidia/nemotron-3-ultra-550b-a55b"),
+        ("NVIDIA Nemotron 3 Super 120B A12B - OpenRouter efficient reasoning MoE", "nvidia/nemotron-3-super-120b-a12b"),
+        ("Google Gemma 4 26B A4B IT - OpenRouter instruction model", "google/gemma-4-26b-a4b-it"),
+        ("Qwen3 Coder - OpenRouter agentic coding model", "qwen/qwen3-coder"),
+        ("OpenAI GPT OSS 120B - OpenRouter larger open-weight reasoning model", "openai/gpt-oss-120b"),
+        ("OpenAI GPT OSS 20B - OpenRouter open-weight reasoning/coding", "openai/gpt-oss-20b"),
+        ("OpenRouter Free Router - Free-tier model router", "openrouter/free"),
+        ("Custom model ID", "custom"),
+    ],
+}
+
+
 MODEL_OPTIONS: ProviderModeOptions = {
     "openai": {
         "quick": [
@@ -179,7 +201,12 @@ MODEL_OPTIONS: ProviderModeOptions = {
     # Build.NVIDIA.com preview page plus "Custom model ID" for any current
     # model card ID (for example publisher/model-name).
     "nvidia": _NVIDIA_MODELS,
-    # OpenRouter: fetched dynamically. Azure: any deployed model name.
+    # OpenRouter is OpenAI-compatible and also supports dynamic model lookup
+    # in the CLI. These curated options keep the web UI and offline CLI path
+    # focused on project-preferred models while "Custom model ID" allows any
+    # current OpenRouter model slug.
+    "openrouter": _OPENROUTER_MODELS,
+    # Azure: any deployed model name.
     # Ollama display labels intentionally omit a "local" marker — the
     # endpoint is now configurable via OLLAMA_BASE_URL, so the same labels
     # apply whether the user runs ollama-serve on localhost or against a
