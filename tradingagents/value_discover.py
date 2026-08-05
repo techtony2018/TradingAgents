@@ -705,25 +705,48 @@ def _md(value: str) -> str:
 def main() -> None:
     from tradingagents.public_equity import write_idea_generation_payload
     from tradingagents.report_index import write_report_index
+    from tradingagents.value_discover_analysis import (
+        analysis_batch_status,
+        analysis_provider_provenance,
+        build_candidate_analysis_input,
+        normalize_embedded_results,
+        resolve_analysis_mode,
+        resolve_analysis_timeout,
+        run_analysis_batch,
+    )
 
     output_dir = Path(os.environ.get("TRADINGAGENTS_VALUE_DISCOVER_DIR", "reports/value_discover"))
     limit = _env_int("TRADINGAGENTS_VALUE_DISCOVER_LIMIT", 10)
     as_of = dt.datetime.now()
+    analysis_date = as_of.strftime("%Y-%m-%d")
     run_dir = output_dir / as_of.strftime("%Y-%m-%d")
     run_dir.mkdir(parents=True, exist_ok=True)
     status_path = run_dir / "status.json"
     llm_config = value_discover_llm_config()
+    analysis_mode = resolve_analysis_mode()
+    codex_runtime = _codex_runtime_version() if analysis_mode == "codex" else "not-invoked"
+    provider_provenance = analysis_provider_provenance(
+        analysis_mode,
+        embedded_config=llm_config,
+        codex_runtime=codex_runtime,
+    )
+    status_base = {
+        "analysis_date": analysis_date,
+        "started_at": as_of.isoformat(),
+        "analysis_mode": analysis_mode,
+        "analysis_provider_provenance": provider_provenance,
+        **_llm_status_fields(llm_config),
+    }
     _write_value_status(
         status_path,
         {
             "status": "running",
-            "analysis_date": as_of.strftime("%Y-%m-%d"),
-            "started_at": as_of.isoformat(),
-            **_llm_status_fields(llm_config),
+            **status_base,
+            "analysis_status": "pending",
             "steps": [
                 {"id": "screen", "label": "Screen universe", "status": "running"},
                 {"id": "public_equity", "label": "Write Public Equity triage", "status": "pending"},
-                {"id": "llm_analysis", "label": "Run LLM analysis", "status": "pending"},
+                {"id": "llm_analysis", "label": "Run candidate analysis", "status": "pending"},
                 {"id": "index_report", "label": "Update report index", "status": "pending"},
             ],
         },
@@ -741,16 +764,15 @@ def main() -> None:
             status_path,
             {
                 "status": "running",
-                "analysis_date": as_of.strftime("%Y-%m-%d"),
-                "started_at": as_of.isoformat(),
+                **status_base,
                 "candidate_count": len(candidates),
                 "value_discover_markdown": str(markdown_path),
                 "value_discover_csv": str(csv_path),
-                **_llm_status_fields(llm_config),
+                "analysis_status": "pending",
                 "steps": [
                     {"id": "screen", "label": "Screen universe", "status": "ok"},
                     {"id": "public_equity", "label": "Write Public Equity triage", "status": "running"},
-                    {"id": "llm_analysis", "label": "Run LLM analysis", "status": "pending"},
+                    {"id": "llm_analysis", "label": "Run candidate analysis", "status": "pending"},
                     {"id": "index_report", "label": "Update report index", "status": "pending"},
                 ],
             },
@@ -764,42 +786,87 @@ def main() -> None:
         )
         print(f"Public Equity payload: {public_equity_json}")
         print(f"Public Equity triage: {public_equity_markdown}")
-        llm_enabled = os.environ.get("TRADINGAGENTS_VALUE_DISCOVER_LLM_ENABLED", "true")
-        summary_path = None
-        results = []
         _write_value_status(
             status_path,
             {
                 "status": "running",
-                "analysis_date": as_of.strftime("%Y-%m-%d"),
-                "started_at": as_of.isoformat(),
+                **status_base,
                 "candidate_count": len(candidates),
                 "value_discover_markdown": str(markdown_path),
                 "value_discover_csv": str(csv_path),
                 "public_equity_payload": str(public_equity_json),
                 "public_equity_markdown": str(public_equity_markdown),
-                **_llm_status_fields(llm_config),
+                "analysis_status": "running" if analysis_mode != "disabled" else "skipped",
                 "steps": [
                     {"id": "screen", "label": "Screen universe", "status": "ok"},
                     {"id": "public_equity", "label": "Write Public Equity triage", "status": "ok"},
-                    {"id": "llm_analysis", "label": "Run LLM analysis", "status": "running"},
+                    {
+                        "id": "llm_analysis",
+                        "label": "Run candidate analysis",
+                        "status": "running" if analysis_mode != "disabled" else "skipped",
+                    },
                     {"id": "index_report", "label": "Update report index", "status": "pending"},
                 ],
             },
         )
-        if llm_enabled.strip().lower() in ("1", "true", "yes", "on"):
-            llm_limit = _env_int("TRADINGAGENTS_VALUE_DISCOVER_LLM_LIMIT", len(candidates))
-            timeout_seconds = _env_int("TRADINGAGENTS_VALUE_DISCOVER_LLM_TIMEOUT_SECONDS", 180)
-            results, summary_path = run_llm_analysis_for_candidates(
-                candidates[:llm_limit],
-                output_dir=output_dir,
-                analysis_date=dt.date.today().isoformat(),
-                config=llm_config,
-                per_ticker_timeout_seconds=timeout_seconds,
+        analysis_limit = _env_int(
+            "TRADINGAGENTS_VALUE_DISCOVER_ANALYSIS_LIMIT",
+            _env_int("TRADINGAGENTS_VALUE_DISCOVER_LLM_LIMIT", len(candidates)),
+        )
+        selected_candidates = candidates[:analysis_limit]
+        source_record = {
+            "source_id": "value-discover-csv",
+            "source_type": "deterministic_screen_output",
+            "location": str(csv_path),
+            "as_of": analysis_date,
+            "retrieved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        analysis_inputs = [
+            build_candidate_analysis_input(
+                candidate,
+                rank=rank,
+                analysis_date=analysis_date,
+                sources=(source_record,),
             )
-            ok_count = sum(1 for result in results if result.status == "ok")
-            print(f"LLM analysis completed: {ok_count}/{len(results)} succeeded")
-            print(f"LLM summary: {summary_path}")
+            for rank, candidate in enumerate(selected_candidates, start=1)
+        ]
+
+        def embedded_runner(inputs):
+            legacy_results, _ = run_llm_analysis_for_candidates(
+                selected_candidates[: len(inputs)],
+                output_dir=output_dir,
+                analysis_date=analysis_date,
+                config=llm_config,
+                per_ticker_timeout_seconds=resolve_analysis_timeout(),
+            )
+            runtime = "/".join(
+                str(value)
+                for value in (
+                    llm_config.get("llm_provider"),
+                    llm_config.get("quick_think_llm"),
+                    llm_config.get("deep_think_llm"),
+                )
+                if value
+            )
+            return normalize_embedded_results(inputs, legacy_results, runtime=runtime)
+
+        results, summary_path, ledger_path = run_analysis_batch(
+            analysis_inputs,
+            mode=analysis_mode,
+            output_dir=run_dir / "candidate_analysis",
+            timeout_seconds=resolve_analysis_timeout(),
+            project_dir=Path(__file__).resolve().parents[1],
+            embedded_runner=embedded_runner if analysis_mode == "embedded" else None,
+            embedded_config=llm_config,
+            codex_runtime=codex_runtime,
+        )
+        analysis_status = analysis_batch_status(analysis_mode, results)
+        print(
+            f"Candidate analysis mode={analysis_mode} status={analysis_status} "
+            f"completed={sum(1 for result in results if result['status'] == 'ok')}/{len(analysis_inputs)}"
+        )
+        print(f"Candidate analysis summary: {summary_path}")
+        if analysis_mode != "disabled":
             public_equity_json, public_equity_markdown = write_idea_generation_payload(
                 candidates,
                 as_of=as_of,
@@ -808,25 +875,64 @@ def main() -> None:
                 csv_path=csv_path,
                 llm_summary_path=summary_path,
             )
+        analysis_schema_path = run_dir / "candidate_analysis" / "analysis_output.schema.json"
+        analysis_fields = {
+            "analysis_status": analysis_status,
+            "analysis_expected_count": len(analysis_inputs),
+            "analysis_attempted_count": len(results),
+            "analysis_summary": str(summary_path),
+            "analysis_results": str(ledger_path),
+            "analysis_output_schema": str(analysis_schema_path),
+        }
+        if analysis_mode == "codex" and analysis_status != "ok":
+            _write_value_status(
+                status_path,
+                {
+                    "status": "error",
+                    **status_base,
+                    **analysis_fields,
+                    "completed_at": dt.datetime.now().isoformat(),
+                    "candidate_count": len(candidates),
+                    "analysis_success_count": sum(
+                        1 for result in results if result["status"] == "ok"
+                    ),
+                    "analysis_error_count": sum(
+                        1 for result in results if result["status"] != "ok"
+                    ),
+                    "value_discover_markdown": str(markdown_path),
+                    "value_discover_csv": str(csv_path),
+                    "public_equity_payload": str(public_equity_json),
+                    "public_equity_markdown": str(public_equity_markdown),
+                    "error": results[-1]["error"] if results else "Codex analysis produced no result",
+                    "steps": [
+                        {"id": "screen", "label": "Screen universe", "status": "ok"},
+                        {"id": "public_equity", "label": "Write Public Equity triage", "status": "ok"},
+                        {"id": "llm_analysis", "label": "Run candidate analysis", "status": analysis_status},
+                        {"id": "index_report", "label": "Update report index", "status": "skipped"},
+                    ],
+                },
+            )
+            raise RuntimeError(results[-1]["error"] if results else "Codex analysis failed")
         _write_value_status(
             status_path,
             {
                 "status": "running",
-                "analysis_date": as_of.strftime("%Y-%m-%d"),
-                "started_at": as_of.isoformat(),
+                **status_base,
+                **analysis_fields,
                 "candidate_count": len(candidates),
-                "llm_success_count": sum(1 for result in results if result.status == "ok"),
-                "llm_error_count": sum(1 for result in results if result.status == "error"),
+                "analysis_success_count": sum(1 for result in results if result["status"] == "ok"),
+                "analysis_error_count": sum(1 for result in results if result["status"] != "ok"),
+                "llm_success_count": sum(1 for result in results if result["status"] == "ok") if analysis_mode == "embedded" else 0,
+                "llm_error_count": sum(1 for result in results if result["status"] != "ok") if analysis_mode == "embedded" else 0,
                 "value_discover_markdown": str(markdown_path),
                 "value_discover_csv": str(csv_path),
                 "public_equity_payload": str(public_equity_json),
                 "public_equity_markdown": str(public_equity_markdown),
-                "llm_summary": str(summary_path) if summary_path else None,
-                **_llm_status_fields(llm_config),
+                "llm_summary": str(summary_path) if analysis_mode == "embedded" else None,
                 "steps": [
                     {"id": "screen", "label": "Screen universe", "status": "ok"},
                     {"id": "public_equity", "label": "Write Public Equity triage", "status": "ok"},
-                    {"id": "llm_analysis", "label": "Run LLM analysis", "status": "ok"},
+                    {"id": "llm_analysis", "label": "Run candidate analysis", "status": analysis_status},
                     {"id": "index_report", "label": "Update report index", "status": "running"},
                 ],
             },
@@ -837,40 +943,65 @@ def main() -> None:
             status_path,
             {
                 "status": "ok",
-                "analysis_date": as_of.strftime("%Y-%m-%d"),
-                "started_at": as_of.isoformat(),
+                **status_base,
+                **analysis_fields,
                 "completed_at": dt.datetime.now().isoformat(),
                 "candidate_count": len(candidates),
-                "llm_success_count": sum(1 for result in results if result.status == "ok"),
-                "llm_error_count": sum(1 for result in results if result.status == "error"),
+                "analysis_success_count": sum(1 for result in results if result["status"] == "ok"),
+                "analysis_error_count": sum(1 for result in results if result["status"] != "ok"),
+                "llm_success_count": sum(1 for result in results if result["status"] == "ok") if analysis_mode == "embedded" else 0,
+                "llm_error_count": sum(1 for result in results if result["status"] != "ok") if analysis_mode == "embedded" else 0,
                 "value_discover_markdown": str(markdown_path),
                 "value_discover_csv": str(csv_path),
                 "public_equity_payload": str(public_equity_json),
                 "public_equity_markdown": str(public_equity_markdown),
-                "llm_summary": str(summary_path) if summary_path else None,
+                "llm_summary": str(summary_path) if analysis_mode == "embedded" else None,
                 "report_index": str(index_path),
-                **_llm_status_fields(llm_config),
                 "steps": [
                     {"id": "screen", "label": "Screen universe", "status": "ok"},
                     {"id": "public_equity", "label": "Write Public Equity triage", "status": "ok"},
-                    {"id": "llm_analysis", "label": "Run LLM analysis", "status": "ok"},
+                    {"id": "llm_analysis", "label": "Run candidate analysis", "status": analysis_status},
                     {"id": "index_report", "label": "Update report index", "status": "ok"},
                 ],
             },
         )
+        write_report_index(output_dir.parent)
     except Exception as exc:
-        _write_value_status(
-            status_path,
+        existing = _read_value_status(status_path)
+        existing.update(
             {
                 "status": "error",
-                "analysis_date": as_of.strftime("%Y-%m-%d"),
-                "started_at": as_of.isoformat(),
+                **status_base,
                 "completed_at": dt.datetime.now().isoformat(),
                 "error": str(exc),
-                **_llm_status_fields(llm_config),
-            },
+            }
+        )
+        _write_value_status(
+            status_path,
+            existing,
         )
         raise
+
+
+def _codex_runtime_version() -> str:
+    try:
+        completed = subprocess.run(
+            ["codex", "--version"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    return (completed.stdout or completed.stderr or "unavailable").strip()
+
+
+def _read_value_status(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _env_int(name: str, default: int) -> int:

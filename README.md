@@ -174,17 +174,28 @@ You will see a screen where you can select your desired tickers, analysis date, 
 
 ### Value Discover
 
-Value Discover generates a daily quantitative shortlist of up to 10 potentially undervalued US stocks for further day-trading or long-term-investment research, then runs TradingAgents LLM analysis on those candidates. It writes Markdown and CSV reports under `reports/value_discover/` and is a research screen, not financial advice or an order recommendation.
+Value Discover generates a daily quantitative shortlist of up to 10 potentially undervalued US stocks for further research, then runs one explicitly selected candidate-analysis backend. It writes screen, analysis, status, and index artifacts under `reports/value_discover/` and is a research screen, not financial advice or an order recommendation.
 
-Run it immediately:
+The default analysis backend is Codex execution/orchestration through the installed Codex CLI and current Codex account. The Codex subprocess is ephemeral, read-only, schema-constrained, bounded by a per-candidate timeout, and receives no external-model API-key environment variables. A failed Codex candidate stops the batch and never falls back to the embedded model path.
+
+Run the default Codex path immediately:
 ```bash
 tradingagents value-discover
 ```
 
-Run only the quantitative shortlist without LLM analysis:
+Select the existing embedded TradingAgentsGraph path explicitly (OpenRouter/Gemma by default):
 ```bash
-tradingagents value-discover --skip-llm
+tradingagents value-discover --analysis-mode embedded
 ```
+
+Run only the deterministic shortlist and Public Equity routing:
+```bash
+tradingagents value-discover --analysis-mode disabled
+```
+
+The environment switch is `TRADINGAGENTS_VALUE_DISCOVER_ANALYSIS_MODE=codex|embedded|disabled`. The legacy `TRADINGAGENTS_VALUE_DISCOVER_LLM_ENABLED=true|false` setting remains supported only for backward compatibility: `true` means explicit embedded mode and `false` means disabled. When neither setting is present, the resolved mode is `codex`.
+
+All active modes use the same candidate input envelope and structured output/provenance contract. Every candidate financial field carries canonical source IDs and an as-of date, or an explicit unknown marker. `status.json`, `reports/index.json`, and `candidate_analysis/analysis_results.json` expose the resolved mode, batch status, provider provenance, expected/attempted counts, and whether an external model API was invoked. See [`docs/value-discover-analysis-modes-2026-08-02.md`](docs/value-discover-analysis-modes-2026-08-02.md) for the architecture, failure semantics, verification commands, and rollout boundary.
 
 Install the daily schedule for 7:20 AM Pacific time:
 ```bash

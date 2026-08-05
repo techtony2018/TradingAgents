@@ -1,5 +1,7 @@
 from typing import Optional
+from collections.abc import Mapping
 import datetime
+import os
 import typer
 import questionary
 from pathlib import Path
@@ -34,9 +36,9 @@ from tradingagents.value_discover import (
     PACIFIC_TZ,
     cron_entry as value_discover_cron_entry,
     install_cron as install_value_discover_cron,
-    run_llm_analysis_for_candidates,
-    run_value_discover,
+    main as run_value_discover_workflow,
 )
+from tradingagents.value_discover_analysis import resolve_analysis_mode
 from cli.models import AnalystType
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
@@ -1340,10 +1342,15 @@ def value_discover(
         "--install-cron",
         help="Install or replace the daily 7:20 AM Pacific Value Discover crontab entry.",
     ),
-    run_llm: bool = typer.Option(
-        True,
+    analysis_mode: Optional[str] = typer.Option(
+        None,
+        "--analysis-mode",
+        help="Candidate analysis backend: codex (default), embedded, or disabled.",
+    ),
+    run_llm: Optional[bool] = typer.Option(
+        None,
         "--llm/--skip-llm",
-        help="Run TradingAgents LLM analysis for the discovered stocks.",
+        help="Legacy explicit embedded opt-in or analysis disable; omit for Codex default.",
     ),
 ):
     """Generate the Value Discover undervaluation watchlist."""
@@ -1361,33 +1368,42 @@ def value_discover(
         console.print(entry)
         return
 
-    console.print("[bold cyan]Running Value Discover...[/bold cyan]")
-    console.print(
-        "[yellow]Research shortlist only. Not financial advice or an order recommendation.[/yellow]"
+    resolved_mode = _resolve_value_discover_analysis_mode(
+        analysis_mode,
+        run_llm,
+        os.environ,
     )
-    candidates, markdown_path, csv_path = run_value_discover(
-        limit=limit,
-        output_dir=output_dir,
-    )
-    console.print(f"[green]✓ Found {len(candidates)} candidates.[/green]")
-    console.print(f"[dim]Markdown:[/dim] {markdown_path.resolve()}")
-    console.print(f"[dim]CSV:[/dim] {csv_path.resolve()}")
-    for rank, item in enumerate(candidates, start=1):
-        console.print(
-            f"{rank:>2}. [bold]{item.symbol}[/bold] "
-            f"score={item.score:.1f} price={item.price if item.price is not None else 'N/A'} "
-            f"thesis={item.thesis}"
-        )
+    overrides = {
+        "TRADINGAGENTS_VALUE_DISCOVER_ANALYSIS_MODE": resolved_mode,
+        "TRADINGAGENTS_VALUE_DISCOVER_LIMIT": str(limit),
+        "TRADINGAGENTS_VALUE_DISCOVER_DIR": str(output_dir),
+    }
+    previous = {name: os.environ.get(name) for name in overrides}
+    try:
+        os.environ.update(overrides)
+        run_value_discover_workflow()
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
-    if run_llm:
-        console.print("\n[bold cyan]Running LLM analysis for Value Discover candidates...[/bold cyan]")
-        results, summary_path = run_llm_analysis_for_candidates(
-            candidates,
-            output_dir=output_dir,
+
+def _resolve_value_discover_analysis_mode(
+    analysis_mode: str | None,
+    legacy_llm: bool | None,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    if analysis_mode is not None and legacy_llm is not None:
+        raise typer.BadParameter("Use --analysis-mode or --llm/--skip-llm, not both")
+    if analysis_mode is not None:
+        return resolve_analysis_mode(
+            {"TRADINGAGENTS_VALUE_DISCOVER_ANALYSIS_MODE": analysis_mode}
         )
-        ok_count = sum(1 for result in results if result.status == "ok")
-        console.print(f"[green]✓ LLM analysis complete: {ok_count}/{len(results)} succeeded.[/green]")
-        console.print(f"[dim]LLM summary:[/dim] {summary_path.resolve()}")
+    if legacy_llm is not None:
+        return "embedded" if legacy_llm else "disabled"
+    return resolve_analysis_mode(environ)
 
 
 if __name__ == "__main__":

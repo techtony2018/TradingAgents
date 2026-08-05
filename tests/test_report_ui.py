@@ -54,6 +54,25 @@ def test_report_index_discovers_latest_value_discover_run(tmp_path):
         "# Summary\n\n| Ticker | Status | Decision | Report | Error |\n| --- | --- | --- | --- | --- |\n| CHEAP | ok | Buy | path |  |\n",
         encoding="utf-8",
     )
+    (day / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "analysis_mode": "codex",
+                "analysis_status": "ok",
+                "analysis_provider_provenance": {
+                    "execution_provider": "codex_cli",
+                    "runtime": "codex-cli-test",
+                    "external_model_api_invoked": False,
+                    "embedded_provider": None,
+                    "embedded_models": [],
+                },
+                "analysis_summary": str(day / "candidate_analysis" / "summary.md"),
+                "analysis_results": str(day / "candidate_analysis" / "analysis_results.json"),
+            }
+        ),
+        encoding="utf-8",
+    )
 
     index_path = write_report_index(tmp_path)
     index = build_report_index(tmp_path)
@@ -67,6 +86,10 @@ def test_report_index_discovers_latest_value_discover_run(tmp_path):
     assert index["latest_value_discover"]["llm_success_count"] == 1
     assert index["latest_value_discover"]["public_equity_workflow_route_count"] == 1
     assert index["latest_value_discover"]["top_public_equity_routes"][0]["workflow"] == "company-tearsheet"
+    assert index["latest_value_discover"]["analysis_mode"] == "codex"
+    assert index["latest_value_discover"]["analysis_status"] == "ok"
+    assert index["latest_value_discover"]["analysis_provider_provenance"]["execution_provider"] == "codex_cli"
+    assert index["latest_value_discover"]["analysis_provider_provenance"]["external_model_api_invoked"] is False
 
 
 def test_report_index_discovers_stock_analysis_runs(tmp_path):

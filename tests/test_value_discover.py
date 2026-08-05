@@ -153,6 +153,17 @@ def test_value_discover_defaults_to_openrouter_gemma(monkeypatch):
     assert config["backend_url"] is None
 
 
+def test_cli_analysis_mode_defaults_to_codex_and_keeps_embedded_explicit():
+    from cli import main as cli_main
+
+    resolve = getattr(cli_main, "_resolve_value_discover_analysis_mode", None)
+    assert callable(resolve)
+    assert resolve(None, None, {}) == "codex"
+    assert resolve("embedded", None, {}) == "embedded"
+    assert resolve(None, True, {}) == "embedded"
+    assert resolve(None, False, {}) == "disabled"
+
+
 def test_llm_analysis_records_timeout(tmp_path):
     candidates, _, _ = run_value_discover(
         universe=("CHEAP",),
