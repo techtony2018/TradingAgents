@@ -709,8 +709,10 @@ def main() -> None:
         analysis_batch_status,
         analysis_provider_provenance,
         build_candidate_analysis_input,
+        load_recent_analysis_reuse,
         normalize_embedded_results,
         resolve_analysis_mode,
+        resolve_research_reuse_days,
         resolve_analysis_timeout,
         run_analysis_batch,
     )
@@ -724,6 +726,7 @@ def main() -> None:
     status_path = run_dir / "status.json"
     llm_config = value_discover_llm_config()
     analysis_mode = resolve_analysis_mode()
+    research_reuse_days = resolve_research_reuse_days()
     codex_runtime = _codex_runtime_version() if analysis_mode == "codex" else "not-invoked"
     provider_provenance = analysis_provider_provenance(
         analysis_mode,
@@ -734,6 +737,7 @@ def main() -> None:
         "analysis_date": analysis_date,
         "started_at": as_of.isoformat(),
         "analysis_mode": analysis_mode,
+        "analysis_reuse_days": research_reuse_days,
         "analysis_provider_provenance": provider_provenance,
         **_llm_status_fields(llm_config),
     }
@@ -830,10 +834,23 @@ def main() -> None:
             )
             for rank, candidate in enumerate(selected_candidates, start=1)
         ]
+        reuse_by_symbol = load_recent_analysis_reuse(
+            output_dir,
+            analysis_date=analysis_date,
+            mode=analysis_mode,
+            max_age_days=research_reuse_days,
+        )
 
         def embedded_runner(inputs):
+            candidates_by_symbol = {
+                candidate.symbol.upper(): candidate for candidate in selected_candidates
+            }
+            fresh_candidates = [
+                candidates_by_symbol[str(payload["candidate"]["symbol"]).upper()]
+                for payload in inputs
+            ]
             legacy_results, _ = run_llm_analysis_for_candidates(
-                selected_candidates[: len(inputs)],
+                fresh_candidates,
                 output_dir=output_dir,
                 analysis_date=analysis_date,
                 config=llm_config,
@@ -859,11 +876,21 @@ def main() -> None:
             embedded_runner=embedded_runner if analysis_mode == "embedded" else None,
             embedded_config=llm_config,
             codex_runtime=codex_runtime,
+            reuse_by_symbol=reuse_by_symbol,
         )
+        ledger_payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+        analysis_attempted_count = int(
+            ledger_payload.get("attempted_count", len(results))
+        )
+        analysis_researched_count = int(
+            ledger_payload.get("researched_count", analysis_attempted_count)
+        )
+        analysis_reused_count = int(ledger_payload.get("reused_count", 0))
         analysis_status = analysis_batch_status(analysis_mode, results)
         print(
             f"Candidate analysis mode={analysis_mode} status={analysis_status} "
-            f"completed={sum(1 for result in results if result['status'] == 'ok')}/{len(analysis_inputs)}"
+            f"completed={sum(1 for result in results if result['status'] == 'ok')}/{len(analysis_inputs)} "
+            f"researched={analysis_researched_count} reused={analysis_reused_count}"
         )
         print(f"Candidate analysis summary: {summary_path}")
         if analysis_mode != "disabled":
@@ -879,7 +906,9 @@ def main() -> None:
         analysis_fields = {
             "analysis_status": analysis_status,
             "analysis_expected_count": len(analysis_inputs),
-            "analysis_attempted_count": len(results),
+            "analysis_attempted_count": analysis_attempted_count,
+            "analysis_researched_count": analysis_researched_count,
+            "analysis_reused_count": analysis_reused_count,
             "analysis_summary": str(summary_path),
             "analysis_results": str(ledger_path),
             "analysis_output_schema": str(analysis_schema_path),

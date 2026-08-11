@@ -52,6 +52,7 @@ EXTERNAL_MODEL_CREDENTIAL_ENV_VARS = (
     "ZHIPU_API_KEY",
     "ZHIPU_CN_API_KEY",
 )
+DEFAULT_RESEARCH_REUSE_DAYS = 7
 
 _OUTPUT_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -153,6 +154,87 @@ def resolve_analysis_timeout(environ: Mapping[str, str] | None = None) -> int:
     if timeout <= 0:
         raise ValueError("Value Discover analysis timeout must be a positive integer")
     return timeout
+
+
+def resolve_research_reuse_days(environ: Mapping[str, str] | None = None) -> int:
+    """Resolve the age limit for reusing a successful prior candidate analysis."""
+    values = os.environ if environ is None else environ
+    raw = values.get(
+        "TRADINGAGENTS_VALUE_DISCOVER_RESEARCH_REUSE_DAYS",
+        str(DEFAULT_RESEARCH_REUSE_DAYS),
+    ).strip()
+    try:
+        days = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "Value Discover research reuse window must be a non-negative integer"
+        ) from exc
+    if days < 0:
+        raise ValueError(
+            "Value Discover research reuse window must be a non-negative integer"
+        )
+    return days
+
+
+def load_recent_analysis_reuse(
+    output_dir: Path | str,
+    *,
+    analysis_date: str,
+    mode: str,
+    max_age_days: int,
+) -> dict[str, dict[str, Any]]:
+    """Find the newest reusable successful result for each symbol.
+
+    Reuse is deliberately conservative: only older daily ledgers, the same
+    explicit backend mode, a successful result, and the configured age window
+    qualify. Invalid or incomplete historical ledgers are ignored.
+    """
+    if mode == "disabled" or max_age_days <= 0:
+        return {}
+    current_day = datetime.strptime(analysis_date, "%Y-%m-%d").date()
+    root = Path(output_dir)
+    dated_dirs: list[tuple[Any, Path]] = []
+    if not root.exists():
+        return {}
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            day = datetime.strptime(child.name, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        age_days = (current_day - day).days
+        if 1 <= age_days <= max_age_days:
+            dated_dirs.append((day, child))
+
+    reusable: dict[str, dict[str, Any]] = {}
+    for day, run_dir in sorted(dated_dirs, reverse=True):
+        ledger_path = run_dir / "candidate_analysis" / "analysis_results.json"
+        try:
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(ledger, Mapping) or ledger.get("mode") != mode:
+            continue
+        results = ledger.get("results")
+        if not isinstance(results, list):
+            continue
+        for result in results:
+            if not isinstance(result, Mapping):
+                continue
+            symbol = str(result.get("symbol", "")).strip().upper()
+            if not symbol or symbol in reusable:
+                continue
+            try:
+                _validate_reusable_output(result, symbol=symbol, expected_mode=mode)
+            except (ValueError, TypeError):
+                continue
+            reusable[symbol] = {
+                "result": deepcopy(dict(result)),
+                "analysis_date": day.isoformat(),
+                "ledger_path": str(ledger_path),
+            }
+    return reusable
 
 
 def analysis_batch_status(mode: str, outputs: Sequence[Mapping[str, Any]]) -> str:
@@ -327,6 +409,7 @@ def run_analysis_batch(
     embedded_runner: Any = None,
     embedded_config: Mapping[str, Any] | None = None,
     codex_runtime: str = "unavailable",
+    reuse_by_symbol: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], Path, Path]:
     """Run exactly one selected backend and materialize normalized artifacts.
 
@@ -340,27 +423,62 @@ def run_analysis_batch(
     schema_path = root / "analysis_output.schema.json"
     schema_path.write_text(json.dumps(analysis_output_schema(), indent=2), encoding="utf-8")
 
+    reuse_records = reuse_by_symbol or {}
+    candidate_actions: list[dict[str, Any]] = []
+    attempted_count = 0
+    reused_count = 0
+
     if mode == "disabled":
         outputs: list[dict[str, Any]] = []
     elif mode == "embedded":
         if embedded_runner is None:
             raise ValueError("embedded mode requires an explicit embedded_runner")
-        outputs = list(embedded_runner(inputs))
-        for item, payload in zip(inputs, outputs, strict=True):
+        fresh_inputs = [
+            payload
+            for payload in inputs
+            if str(payload["candidate"]["symbol"]).upper() not in reuse_records
+        ]
+        fresh_outputs = list(embedded_runner(fresh_inputs)) if fresh_inputs else []
+        for item, payload in zip(fresh_inputs, fresh_outputs, strict=True):
             _validate_output(payload, item, expected_mode="embedded")
+        fresh_iter = iter(fresh_outputs)
+        outputs = []
+        for payload in inputs:
+            symbol = str(payload["candidate"]["symbol"]).upper()
+            reuse = reuse_records.get(symbol)
+            if reuse is not None:
+                output = _validated_reused_result(reuse, symbol=symbol, mode=mode)
+                reused_count += 1
+                action = _reuse_action(symbol, output, reuse)
+            else:
+                output = next(fresh_iter)
+                attempted_count += 1
+                action = _researched_action(payload)
+            outputs.append(output)
+            candidate_actions.append(action)
     else:
         outputs = []
         for payload in inputs:
-            output = _run_codex_candidate(
-                payload,
-                root=root,
-                schema_path=schema_path,
-                timeout_seconds=timeout_seconds,
-                project_dir=Path(project_dir),
-                command_runner=command_runner,
-                codex_runtime=codex_runtime,
-            )
+            symbol = str(payload["candidate"]["symbol"]).upper()
+            reuse = reuse_records.get(symbol)
+            if reuse is not None:
+                output = _validated_reused_result(reuse, symbol=symbol, mode=mode)
+                reused_count += 1
+                action = _reuse_action(symbol, output, reuse)
+            else:
+                output = _run_codex_candidate(
+                    payload,
+                    root=root,
+                    schema_path=schema_path,
+                    timeout_seconds=timeout_seconds,
+                    project_dir=Path(project_dir),
+                    command_runner=command_runner,
+                    codex_runtime=codex_runtime,
+                )
+                attempted_count += 1
+                action = _researched_action(payload)
             outputs.append(output)
+            candidate_actions.append(action)
             if output["status"] != "ok":
                 break
 
@@ -389,7 +507,10 @@ def run_analysis_batch(
                 "batch_status": batch_status,
                 "provider_provenance": provider_provenance,
                 "expected_count": len(inputs),
-                "attempted_count": len(outputs),
+                "attempted_count": attempted_count,
+                "researched_count": attempted_count,
+                "reused_count": reused_count,
+                "candidate_actions": candidate_actions,
                 "source_registry": source_registry,
                 "generated_at": generated_at,
                 "result_count": len(outputs),
@@ -401,7 +522,14 @@ def run_analysis_batch(
     )
     summary_path = root / "summary.md"
     summary_path.write_text(
-        _render_summary(mode, outputs, generated_at, batch_status), encoding="utf-8"
+        _render_summary(
+            mode,
+            outputs,
+            generated_at,
+            batch_status,
+            candidate_actions,
+        ),
+        encoding="utf-8",
     )
     return outputs, summary_path, ledger_path
 
@@ -576,6 +704,68 @@ def _validate_output(
         raise ValueError("output provenance references an unknown source_id")
 
 
+def _validate_reusable_output(
+    output: Mapping[str, Any],
+    *,
+    symbol: str,
+    expected_mode: str,
+) -> None:
+    if output.get("status") != "ok":
+        raise ValueError("only successful prior analysis can be reused")
+    source_ids = {
+        str(source_id)
+        for claim in output.get("claims", [])
+        if isinstance(claim, Mapping)
+        for source_id in claim.get("source_ids", [])
+    }
+    provenance = output.get("provenance")
+    if isinstance(provenance, Mapping):
+        source_ids.update(str(value) for value in provenance.get("source_ids", []))
+    candidate_input = {
+        "analysis_id": output.get("analysis_id"),
+        "candidate": {"symbol": symbol},
+        "sources": [{"source_id": source_id} for source_id in source_ids],
+    }
+    _validate_output(output, candidate_input, expected_mode=expected_mode)
+
+
+def _validated_reused_result(
+    reuse: Mapping[str, Any],
+    *,
+    symbol: str,
+    mode: str,
+) -> dict[str, Any]:
+    result = reuse.get("result")
+    if not isinstance(result, Mapping):
+        raise ValueError(f"reusable analysis for {symbol} has no result")
+    _validate_reusable_output(result, symbol=symbol, expected_mode=mode)
+    return deepcopy(dict(result))
+
+
+def _reuse_action(
+    symbol: str,
+    output: Mapping[str, Any],
+    reuse: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "action": "reused",
+        "analysis_id": output["analysis_id"],
+        "analysis_date": reuse.get("analysis_date"),
+        "ledger_path": str(reuse["ledger_path"]) if reuse.get("ledger_path") else None,
+    }
+
+
+def _researched_action(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "symbol": str(payload["candidate"]["symbol"]).upper(),
+        "action": "researched",
+        "analysis_id": payload["analysis_id"],
+        "analysis_date": payload.get("analysis_date"),
+        "ledger_path": None,
+    }
+
+
 def _error_output(
     payload: Mapping[str, Any],
     *,
@@ -608,6 +798,7 @@ def _render_summary(
     outputs: Sequence[Mapping[str, Any]],
     generated_at: str,
     batch_status: str,
+    candidate_actions: Sequence[Mapping[str, Any]],
 ) -> str:
     lines = [
         "# Value Discover Candidate Analysis",
@@ -618,12 +809,13 @@ def _render_summary(
         "",
         "Research triage only; not financial advice or an order recommendation.",
         "",
-        "| Symbol | Status | Classification | Summary | Error |",
-        "| --- | --- | --- | --- | --- |",
+        "| Symbol | Action | Status | Classification | Summary | Error |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
-    for output in outputs:
+    for output, action in zip(outputs, candidate_actions, strict=True):
         values = [
             str(output.get("symbol", "")),
+            str(action.get("action", "")),
             str(output.get("status", "")),
             str(output.get("classification", "")),
             str(output.get("summary", "")).replace("|", "\\|").replace("\n", " "),

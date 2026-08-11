@@ -28,6 +28,18 @@ Each input contains:
 
 Each output contains classification, summary, typed claims, source IDs, data gaps, executor/runtime provenance, status, and bounded error detail. Allowed classifications are research candidate, watchlist, deprioritized, or unknown. They are research-priority labels, not trading recommendations.
 
+## Recent research reuse
+
+Before invoking an active backend, the scheduled run checks older daily ledgers for the newest successful analysis of each symbol. Reuse requires all of the following:
+
+- the prior run is older than the current run and no more than seven days old by default;
+- the prior result used the same explicit analysis mode;
+- the prior structured result is valid and has `status=ok`.
+
+New symbols, expired results, failed or malformed results, and results from another mode are researched normally. `TRADINGAGENTS_VALUE_DISCOVER_RESEARCH_REUSE_DAYS` changes the non-negative day window; `0` disables reuse.
+
+Reuse is visible rather than silent. `analysis_results.json` includes `researched_count`, `reused_count`, and a `candidate_actions` entry for every materialized result. A reused entry keeps its original analysis ID, date, provenance, and prior ledger path. The Markdown summary adds an `Action` column containing `researched` or `reused`.
+
 ## Codex execution boundary
 
 The Codex adapter uses the officially documented non-interactive interface:
@@ -50,6 +62,9 @@ The scheduled module and CLI write these fields to the daily `status.json`, with
 - `analysis_provider_provenance`
 - `analysis_expected_count`
 - `analysis_attempted_count`
+- `analysis_researched_count`
+- `analysis_reused_count`
+- `analysis_reuse_days`
 - `analysis_success_count`
 - `analysis_error_count`
 - `analysis_summary`

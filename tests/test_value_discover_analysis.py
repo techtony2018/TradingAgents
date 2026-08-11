@@ -76,6 +76,20 @@ def test_timeout_and_batch_status_contracts_are_deterministic():
     assert batch_status("codex", [{"status": "ok"}, {"status": "error"}]) == "partial"
 
 
+def test_research_reuse_window_defaults_to_seven_days_and_can_be_disabled():
+    from tradingagents import value_discover_analysis as analysis
+
+    resolve = getattr(analysis, "resolve_research_reuse_days", None)
+    assert callable(resolve)
+    assert resolve({}) == 7
+    assert resolve({"TRADINGAGENTS_VALUE_DISCOVER_RESEARCH_REUSE_DAYS": "3"}) == 3
+    assert resolve({"TRADINGAGENTS_VALUE_DISCOVER_RESEARCH_REUSE_DAYS": "0"}) == 0
+    with pytest.raises(ValueError, match="reuse window"):
+        resolve({"TRADINGAGENTS_VALUE_DISCOVER_RESEARCH_REUSE_DAYS": "-1"})
+    with pytest.raises(ValueError, match="reuse window"):
+        resolve({"TRADINGAGENTS_VALUE_DISCOVER_RESEARCH_REUSE_DAYS": "weekly"})
+
+
 def test_candidate_input_and_output_schema_are_shared_and_provenance_first(tmp_path):
     from tradingagents import value_discover_analysis as analysis
 
@@ -197,6 +211,147 @@ def _valid_codex_output() -> dict:
         },
         "error": None,
     }
+
+
+def test_recent_successful_same_mode_result_is_discovered_for_reuse(tmp_path):
+    from tradingagents import value_discover_analysis as analysis
+
+    prior_result = _valid_codex_output()
+    prior_result["analysis_id"] = "2026-08-07:01:CHEAP"
+    prior_dir = tmp_path / "2026-08-07" / "candidate_analysis"
+    prior_dir.mkdir(parents=True)
+    ledger_path = prior_dir / "analysis_results.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "mode": "codex",
+                "batch_status": "ok",
+                "results": [prior_result],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_dir = tmp_path / "2026-07-31" / "candidate_analysis"
+    stale_dir.mkdir(parents=True)
+    stale_dir.joinpath("analysis_results.json").write_text(
+        json.dumps({"mode": "codex", "results": [_valid_codex_output()]}),
+        encoding="utf-8",
+    )
+
+    reusable = analysis.load_recent_analysis_reuse(
+        tmp_path,
+        analysis_date="2026-08-08",
+        mode="codex",
+        max_age_days=7,
+    )
+
+    assert set(reusable) == {"CHEAP"}
+    assert reusable["CHEAP"]["analysis_date"] == "2026-08-07"
+    assert reusable["CHEAP"]["ledger_path"] == str(ledger_path)
+    assert reusable["CHEAP"]["result"] == prior_result
+
+
+def test_codex_batch_reuses_successful_candidate_and_researches_only_new_symbol(
+    tmp_path,
+):
+    from tradingagents import value_discover_analysis as analysis
+
+    first = _candidate_input(tmp_path)
+    second = deepcopy(first)
+    second["rank"] = 2
+    second["analysis_id"] = "2026-08-02:02:SECOND"
+    second["candidate"]["symbol"] = "SECOND"
+    prior_result = _valid_codex_output()
+    prior_result["analysis_id"] = "2026-08-01:01:CHEAP"
+    attempts = []
+
+    def command_runner(command, **kwargs):
+        attempts.append(command)
+        output = _valid_codex_output()
+        output["analysis_id"] = "2026-08-02:02:SECOND"
+        output["symbol"] = "SECOND"
+        output_path = Path(command[command.index("-o") + 1])
+        output_path.write_text(json.dumps(output), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    outputs, summary_path, ledger_path = analysis.run_analysis_batch(
+        [first, second],
+        mode="codex",
+        output_dir=tmp_path / "analysis",
+        timeout_seconds=30,
+        project_dir=tmp_path,
+        command_runner=command_runner,
+        codex_runtime="codex-cli-test",
+        reuse_by_symbol={
+            "CHEAP": {
+                "result": prior_result,
+                "analysis_date": "2026-08-01",
+                "ledger_path": "/reports/2026-08-01/candidate_analysis/analysis_results.json",
+            }
+        },
+    )
+
+    assert len(attempts) == 1
+    assert [output["symbol"] for output in outputs] == ["CHEAP", "SECOND"]
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["expected_count"] == 2
+    assert ledger["attempted_count"] == 1
+    assert ledger["researched_count"] == 1
+    assert ledger["reused_count"] == 1
+    assert ledger["candidate_actions"] == [
+        {
+            "symbol": "CHEAP",
+            "action": "reused",
+            "analysis_id": "2026-08-01:01:CHEAP",
+            "analysis_date": "2026-08-01",
+            "ledger_path": "/reports/2026-08-01/candidate_analysis/analysis_results.json",
+        },
+        {
+            "symbol": "SECOND",
+            "action": "researched",
+            "analysis_id": "2026-08-02:02:SECOND",
+            "analysis_date": "2026-08-02",
+            "ledger_path": None,
+        },
+    ]
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "| Symbol | Action | Status |" in summary
+    assert "| CHEAP | reused | ok |" in summary
+    assert "| SECOND | researched | ok |" in summary
+
+
+def test_embedded_batch_does_not_call_backend_when_every_candidate_is_reused(
+    tmp_path,
+):
+    from tradingagents import value_discover_analysis as analysis
+
+    candidate_input = _candidate_input(tmp_path)
+    prior_result = _valid_codex_output()
+    prior_result["mode"] = "embedded"
+    prior_result["analysis_id"] = "2026-08-01:01:CHEAP"
+
+    outputs, _, ledger_path = analysis.run_analysis_batch(
+        [candidate_input],
+        mode="embedded",
+        output_dir=tmp_path / "analysis",
+        timeout_seconds=30,
+        project_dir=tmp_path,
+        embedded_runner=lambda inputs: pytest.fail(
+            "embedded backend must not run when all candidates are reusable"
+        ),
+        reuse_by_symbol={
+            "CHEAP": {
+                "result": prior_result,
+                "analysis_date": "2026-08-01",
+                "ledger_path": "/reports/2026-08-01/candidate_analysis/analysis_results.json",
+            }
+        },
+    )
+
+    assert outputs == [prior_result]
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["attempted_count"] == 0
+    assert ledger["reused_count"] == 1
 
 
 def test_codex_mode_is_ephemeral_read_only_structured_and_writes_report_artifacts(
@@ -433,16 +588,47 @@ def test_scheduled_main_defaults_to_codex_and_writes_status_provenance(
         lambda: "codex-cli-test",
         raising=False,
     )
+    reusable = {
+        "CHEAP": {
+            "result": _valid_codex_output(),
+            "analysis_date": "2026-08-01",
+            "ledger_path": "/reports/2026-08-01/candidate_analysis/analysis_results.json",
+        }
+    }
+
+    def fake_load_recent_analysis_reuse(root, **kwargs):
+        assert Path(root) == output_dir
+        assert kwargs["mode"] == "codex"
+        assert kwargs["max_age_days"] == 7
+        return reusable
+
+    monkeypatch.setattr(
+        analysis,
+        "load_recent_analysis_reuse",
+        fake_load_recent_analysis_reuse,
+    )
 
     def fake_run_analysis_batch(inputs, **kwargs):
         assert kwargs["mode"] == "codex"
+        assert kwargs["reuse_by_symbol"] == reusable
         assert inputs[0]["financial_facts"]["price"]["as_of"]
         root = Path(kwargs["output_dir"])
         root.mkdir(parents=True, exist_ok=True)
         summary = root / "summary.md"
         ledger = root / "analysis_results.json"
         summary.write_text("# Codex proof", encoding="utf-8")
-        ledger.write_text('{"mode":"codex","batch_status":"ok"}', encoding="utf-8")
+        ledger.write_text(
+            json.dumps(
+                {
+                    "mode": "codex",
+                    "batch_status": "ok",
+                    "attempted_count": 0,
+                    "researched_count": 0,
+                    "reused_count": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
         return [_valid_codex_output()], summary, ledger
 
     monkeypatch.setattr(analysis, "run_analysis_batch", fake_run_analysis_batch)
@@ -463,6 +649,10 @@ def test_scheduled_main_defaults_to_codex_and_writes_status_provenance(
     assert status["status"] == "ok"
     assert status["analysis_mode"] == "codex"
     assert status["analysis_status"] == "ok"
+    assert status["analysis_reuse_days"] == 7
+    assert status["analysis_attempted_count"] == 0
+    assert status["analysis_researched_count"] == 0
+    assert status["analysis_reused_count"] == 1
     assert status["analysis_provider_provenance"] == {
         "execution_provider": "codex_cli",
         "runtime": "codex-cli-test",
