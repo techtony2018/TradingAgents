@@ -15,9 +15,10 @@ import os
 import signal
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import pandas as pd
 import yfinance as yf
@@ -65,6 +66,15 @@ class ValueCandidate:
 
 
 @dataclass(frozen=True)
+class ValueSelectionPolicy:
+    """Policy for turning the scored universe into the final research shortlist."""
+
+    recent_lookback_days: int = 5
+    repeat_penalty: float = 3.0
+    max_per_sector: int = 2
+
+
+@dataclass(frozen=True)
 class LLMAnalysisResult:
     symbol: str
     status: str
@@ -80,16 +90,30 @@ def run_value_discover(
     output_dir: Path | str = "reports/value_discover",
     as_of: dt.datetime | None = None,
     ticker_factory: Callable[[str], object] = yf.Ticker,
+    selection_policy: ValueSelectionPolicy | None = None,
+    recent_symbol_counts: Mapping[str, int] | None = None,
 ) -> tuple[list[ValueCandidate], Path, Path]:
     """Generate a top-N undervaluation watchlist and write report artifacts."""
     as_of = as_of or dt.datetime.now()
+    selection_policy = selection_policy or value_selection_policy()
+    if recent_symbol_counts is None:
+        recent_symbol_counts = read_recent_value_discover_symbols(
+            output_dir,
+            as_of.date(),
+            selection_policy.recent_lookback_days,
+        )
     candidates = [
         candidate
         for symbol in universe
         if (candidate := _screen_symbol(symbol, ticker_factory=ticker_factory)) is not None
     ]
     candidates.sort(key=lambda item: item.score, reverse=True)
-    selected = candidates[:limit]
+    selected = select_value_candidates(
+        candidates,
+        limit=limit,
+        policy=selection_policy,
+        recent_symbol_counts=recent_symbol_counts,
+    )
 
     report_root = Path(output_dir) / as_of.strftime("%Y-%m-%d")
     report_root.mkdir(parents=True, exist_ok=True)
@@ -97,9 +121,132 @@ def run_value_discover(
     markdown_path = report_root / f"{stem}.md"
     csv_path = report_root / f"{stem}.csv"
 
-    markdown_path.write_text(render_markdown(selected, as_of=as_of), encoding="utf-8")
+    markdown_path.write_text(
+        render_markdown(
+            selected,
+            as_of=as_of,
+            selection_policy=selection_policy,
+            recent_symbol_counts=recent_symbol_counts,
+        ),
+        encoding="utf-8",
+    )
     _write_csv(selected, csv_path)
     return selected, markdown_path, csv_path
+
+
+def value_selection_policy(
+    environ: Mapping[str, str] | None = None,
+) -> ValueSelectionPolicy:
+    """Resolve repeat-aware final shortlist settings from explicit config."""
+    environ = os.environ if environ is None else environ
+    return ValueSelectionPolicy(
+        recent_lookback_days=max(
+            0,
+            _parse_int(
+                environ.get("TRADINGAGENTS_VALUE_DISCOVER_RECENT_DAYS"),
+                ValueSelectionPolicy.recent_lookback_days,
+            ),
+        ),
+        repeat_penalty=max(
+            0.0,
+            _parse_float(
+                environ.get("TRADINGAGENTS_VALUE_DISCOVER_REPEAT_PENALTY"),
+                ValueSelectionPolicy.repeat_penalty,
+            ),
+        ),
+        max_per_sector=max(
+            0,
+            _parse_int(
+                environ.get("TRADINGAGENTS_VALUE_DISCOVER_MAX_PER_SECTOR"),
+                ValueSelectionPolicy.max_per_sector,
+            ),
+        ),
+    )
+
+
+def read_recent_value_discover_symbols(
+    output_dir: Path | str,
+    as_of_date: dt.date,
+    lookback_days: int,
+) -> dict[str, int]:
+    """Count prior shortlist appearances in recent completed run CSVs."""
+    if lookback_days <= 0:
+        return {}
+
+    root = Path(output_dir)
+    counts: Counter[str] = Counter()
+    for offset in range(1, lookback_days + 1):
+        day = as_of_date - dt.timedelta(days=offset)
+        day_dir = root / day.isoformat()
+        if not day_dir.is_dir():
+            continue
+        day_symbols: set[str] = set()
+        for csv_path in sorted(day_dir.glob("value_discover_*.csv")):
+            try:
+                with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    for row in reader:
+                        symbol = str(row.get("symbol") or "").strip().upper()
+                        if symbol:
+                            day_symbols.add(symbol)
+            except OSError:
+                continue
+        counts.update(day_symbols)
+    return dict(sorted(counts.items()))
+
+
+def select_value_candidates(
+    candidates: Sequence[ValueCandidate],
+    *,
+    limit: int,
+    policy: ValueSelectionPolicy | None = None,
+    recent_symbol_counts: Mapping[str, int] | None = None,
+) -> list[ValueCandidate]:
+    """Select a repeat-aware, sector-aware shortlist from raw scored candidates.
+
+    The raw deterministic score remains the evidence score in reports. This
+    selector only adjusts final ordering enough to avoid repeatedly spending the
+    limited Top-N slots on the same near-tied names.
+    """
+    if limit <= 0:
+        return []
+    policy = policy or value_selection_policy()
+    recent_counts = {
+        str(symbol).upper(): max(0, int(count))
+        for symbol, count in (recent_symbol_counts or {}).items()
+    }
+
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            -_selection_adjusted_score(item, policy, recent_counts),
+            -item.score,
+            item.symbol,
+        ),
+    )
+    if not ranked:
+        return []
+
+    selected: list[ValueCandidate] = []
+    selected_symbols: set[str] = set()
+    sector_counts: Counter[str] = Counter()
+    cap = policy.max_per_sector
+    for candidate in ranked:
+        if cap > 0 and sector_counts[_sector_key(candidate)] >= cap:
+            continue
+        selected.append(candidate)
+        selected_symbols.add(candidate.symbol)
+        sector_counts[_sector_key(candidate)] += 1
+        if len(selected) >= limit:
+            return selected
+
+    for candidate in ranked:
+        if candidate.symbol in selected_symbols:
+            continue
+        selected.append(candidate)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def run_llm_analysis_for_candidates(
@@ -407,13 +554,34 @@ def render_llm_summary(results: Sequence[LLMAnalysisResult], analysis_date: str)
     return "\n".join(lines) + "\n"
 
 
-def render_markdown(candidates: Sequence[ValueCandidate], *, as_of: dt.datetime) -> str:
+def render_markdown(
+    candidates: Sequence[ValueCandidate],
+    *,
+    as_of: dt.datetime,
+    selection_policy: ValueSelectionPolicy | None = None,
+    recent_symbol_counts: Mapping[str, int] | None = None,
+) -> str:
+    selection_policy = selection_policy or ValueSelectionPolicy()
+    recent_symbol_counts = recent_symbol_counts or {}
+    recent_symbols = ", ".join(
+        f"{symbol}×{count}" for symbol, count in sorted(recent_symbol_counts.items())
+    )
     lines = [
         "# Value Discover",
         "",
         f"Generated: {as_of.strftime('%Y-%m-%d %H:%M:%S')}",
         "",
         "Purpose: surface up to 10 potentially undervalued stocks for additional day-trade or long-term-investment research.",
+        "",
+        (
+            "Selection: raw deterministic value score is adjusted only for final shortlist ordering "
+            f"using a {selection_policy.recent_lookback_days}-day repeat window, "
+            f"{selection_policy.repeat_penalty:.1f}-point penalty per prior shortlist appearance, "
+            f"and max {selection_policy.max_per_sector} names per sector before fill. "
+            "The Score column remains the unadjusted deterministic screen score."
+        ),
+        "",
+        f"Recent shortlist appearances considered: {recent_symbols or 'none'}.",
         "",
         "Important: this is a quantitative research shortlist, not financial advice and not an order recommendation. Review news, liquidity, earnings dates, risk limits, and your own strategy before trading.",
         "",
@@ -605,6 +773,19 @@ def _score(info: dict, price: float, history: pd.DataFrame) -> tuple[float, list
     return max(score, 0.0), positives, negatives
 
 
+def _selection_adjusted_score(
+    candidate: ValueCandidate,
+    policy: ValueSelectionPolicy,
+    recent_symbol_counts: Mapping[str, int],
+) -> float:
+    repeat_count = recent_symbol_counts.get(candidate.symbol.upper(), 0)
+    return candidate.score - (policy.repeat_penalty * repeat_count)
+
+
+def _sector_key(candidate: ValueCandidate) -> str:
+    return (candidate.sector or "Unknown").strip() or "Unknown"
+
+
 def _target_upside(info: dict, price: float) -> float | None:
     target = _safe_float(info.get("targetMeanPrice"))
     if target is None or target <= 0 or price <= 0:
@@ -724,6 +905,12 @@ def main() -> None:
     run_dir = output_dir / as_of.strftime("%Y-%m-%d")
     run_dir.mkdir(parents=True, exist_ok=True)
     status_path = run_dir / "status.json"
+    selection_policy = value_selection_policy()
+    recent_symbol_counts = read_recent_value_discover_symbols(
+        output_dir,
+        as_of.date(),
+        selection_policy.recent_lookback_days,
+    )
     llm_config = value_discover_llm_config()
     analysis_mode = resolve_analysis_mode()
     research_reuse_days = resolve_research_reuse_days()
@@ -738,6 +925,8 @@ def main() -> None:
         "started_at": as_of.isoformat(),
         "analysis_mode": analysis_mode,
         "analysis_reuse_days": research_reuse_days,
+        "selection_policy": asdict(selection_policy),
+        "selection_recent_symbol_counts": recent_symbol_counts,
         "analysis_provider_provenance": provider_provenance,
         **_llm_status_fields(llm_config),
     }
@@ -760,6 +949,8 @@ def main() -> None:
             limit=limit,
             output_dir=output_dir,
             as_of=as_of,
+            selection_policy=selection_policy,
+            recent_symbol_counts=recent_symbol_counts,
         )
         print(f"Value Discover completed: {len(candidates)} candidates")
         print(f"Markdown: {markdown_path}")
@@ -1034,11 +1225,23 @@ def _read_value_status(path: Path) -> dict[str, Any]:
 
 
 def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
+    return _parse_int(os.environ.get(name), default)
+
+
+def _parse_int(value: str | None, default: int) -> int:
     if value is None or value.strip() == "":
         return default
     try:
         return int(value)
+    except ValueError:
+        return default
+
+
+def _parse_float(value: str | None, default: float) -> float:
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return float(value)
     except ValueError:
         return default
 

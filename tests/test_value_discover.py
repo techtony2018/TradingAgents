@@ -7,10 +7,14 @@ import pandas as pd
 
 from tradingagents.value_discover import (
     PACIFIC_TZ,
+    ValueCandidate,
+    ValueSelectionPolicy,
     cron_entry,
     render_markdown,
     run_llm_analysis_for_candidates,
     run_value_discover,
+    read_recent_value_discover_symbols,
+    select_value_candidates,
     value_discover_llm_config,
 )
 
@@ -82,6 +86,130 @@ def test_value_discover_markdown_includes_disclaimer():
     markdown = render_markdown([], as_of=dt.datetime(2026, 6, 1, 6, 45, 0))
     assert "not financial advice" in markdown
     assert "not an order recommendation" in markdown
+
+
+def _candidate_for_selection(
+    symbol: str,
+    *,
+    score: float,
+    sector: str = "Industrials",
+) -> ValueCandidate:
+    return ValueCandidate(
+        symbol=symbol,
+        company=f"{symbol} Co",
+        sector=sector,
+        price=50.0,
+        market_cap=50_000_000_000,
+        trailing_pe=10.0,
+        forward_pe=8.0,
+        price_to_book=1.2,
+        ev_to_ebitda=7.0,
+        profit_margin=0.18,
+        return_on_equity=0.19,
+        debt_to_equity=60.0,
+        target_upside_pct=0.30,
+        rsi_14=48.0,
+        avg_volume_20d=2_000_000.0,
+        score=score,
+        thesis="Low valuation",
+        caveats="Target estimate needs corroboration",
+    )
+
+
+def test_value_selector_surfaces_nearby_fresh_alternatives_after_recent_repeats():
+    candidates = [
+        _candidate_for_selection("REPEAT1", score=80),
+        _candidate_for_selection("REPEAT2", score=79),
+        _candidate_for_selection("REPEAT3", score=78),
+        _candidate_for_selection("REPEAT4", score=77),
+        _candidate_for_selection("REPEAT5", score=76),
+        _candidate_for_selection("FRESH1", score=75),
+        _candidate_for_selection("FRESH2", score=74),
+    ]
+
+    selected = select_value_candidates(
+        candidates,
+        limit=5,
+        policy=ValueSelectionPolicy(
+            recent_lookback_days=5,
+            repeat_penalty=3.0,
+            max_per_sector=5,
+        ),
+        recent_symbol_counts={
+            "REPEAT1": 2,
+            "REPEAT2": 2,
+            "REPEAT3": 2,
+            "REPEAT4": 2,
+            "REPEAT5": 2,
+        },
+    )
+
+    symbols = [candidate.symbol for candidate in selected]
+    assert "FRESH1" in symbols
+    assert "FRESH2" in symbols
+    assert symbols != ["REPEAT1", "REPEAT2", "REPEAT3", "REPEAT4", "REPEAT5"]
+
+
+def test_value_selector_keeps_materially_superior_repeated_candidate():
+    candidates = [
+        _candidate_for_selection("DOMINANT", score=92),
+        _candidate_for_selection("FRESH1", score=75),
+        _candidate_for_selection("FRESH2", score=74),
+    ]
+
+    selected = select_value_candidates(
+        candidates,
+        limit=2,
+        policy=ValueSelectionPolicy(
+            recent_lookback_days=5,
+            repeat_penalty=3.0,
+            max_per_sector=5,
+        ),
+        recent_symbol_counts={"DOMINANT": 2},
+    )
+
+    assert [candidate.symbol for candidate in selected] == ["DOMINANT", "FRESH1"]
+
+
+def test_value_selector_limits_sector_concentration_when_alternatives_exist():
+    candidates = [
+        _candidate_for_selection("TECH1", score=80, sector="Technology"),
+        _candidate_for_selection("TECH2", score=79, sector="Technology"),
+        _candidate_for_selection("TECH3", score=78, sector="Technology"),
+        _candidate_for_selection("HEALTH1", score=70, sector="Healthcare"),
+    ]
+
+    selected = select_value_candidates(
+        candidates,
+        limit=3,
+        policy=ValueSelectionPolicy(
+            recent_lookback_days=0,
+            repeat_penalty=0.0,
+            max_per_sector=2,
+        ),
+        recent_symbol_counts={},
+    )
+
+    assert [candidate.symbol for candidate in selected] == ["TECH1", "TECH2", "HEALTH1"]
+
+
+def test_recent_symbol_reader_counts_once_per_prior_day_not_retry_file(tmp_path):
+    prior_day = tmp_path / "2026-08-12"
+    prior_day.mkdir()
+    header = "symbol,company,score\n"
+    for index in range(2):
+        (prior_day / f"value_discover_retry_{index}.csv").write_text(
+            header + "REPEAT,Repeat Co,75\nFRESH,Fresh Co,70\n",
+            encoding="utf-8",
+        )
+
+    counts = read_recent_value_discover_symbols(
+        tmp_path,
+        dt.date(2026, 8, 13),
+        lookback_days=5,
+    )
+
+    assert counts == {"FRESH": 1, "REPEAT": 1}
 
 
 def test_cron_entry_uses_pacific_720_schedule(tmp_path):
